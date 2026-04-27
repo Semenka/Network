@@ -1,0 +1,5 @@
+Notes:
+"When exporting from LinkedIn, the actual header may appear after a few metadata rows."
+First Name,Last Name,URL,Email Address,Company,Position,Connected On
+Alice,Investor,https://www.linkedin.com/in/alice-investor,alice@example.com,Example Ventures,Partner,2025-02-01
+Boris,Builder,https://www.linkedin.com/in/boris-builder,boris@example.com,Builder Studio,AI Product Engineer,2024-12-10

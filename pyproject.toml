@@ -1,0 +1,19 @@
+[project]
+name = "network-chief"
+version = "0.1.0"
+description = "Local-first chief-of-network agent memory, importers, briefs, and OpenClaw workspace assets."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Andrey Semenov" }]
+dependencies = []
+
+[project.scripts]
+network-chief = "network_chief.cli:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["network_chief*"]

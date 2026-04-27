@@ -1,0 +1,20 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# Local private network data. Never commit personal CRM contents.
+data/
+exports/
+*.db
+*.sqlite
+*.sqlite3
+.env
+
+# OpenClaw local runtime state.
+.openclaw/

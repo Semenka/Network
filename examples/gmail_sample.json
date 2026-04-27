@@ -1,0 +1,18 @@
+[
+  {
+    "id": "sample-1",
+    "from": "Alice Investor <alice@example.com>",
+    "to": "Andrey <you@example.com>",
+    "date": "2026-04-27T09:00:00Z",
+    "subject": "Intro to fund partner",
+    "snippet": "Great to reconnect. Happy to introduce you next week."
+  },
+  {
+    "id": "sample-2",
+    "from": "Andrey <you@example.com>",
+    "to": "Boris Builder <boris@example.com>",
+    "date": "2026-04-20T11:30:00Z",
+    "subject": "AI prototype",
+    "snippet": "Thanks for sharing the demo."
+  }
+]
