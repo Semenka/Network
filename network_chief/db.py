@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import uuid
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable
@@ -61,6 +62,10 @@ def init_db(con: sqlite3.Connection) -> None:
             ON people(linkedin_url)
             WHERE linkedin_url IS NOT NULL AND linkedin_url != '';
 
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_people_twitter
+            ON people(lower(twitter_handle))
+            WHERE twitter_handle IS NOT NULL AND twitter_handle != '';
+
         CREATE TABLE IF NOT EXISTS organizations (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL UNIQUE,
@@ -95,6 +100,25 @@ def init_db(con: sqlite3.Connection) -> None:
 
         CREATE UNIQUE INDEX IF NOT EXISTS idx_resources_unique
             ON resources(person_id, resource_type, description);
+
+        CREATE TABLE IF NOT EXISTS connection_values (
+            id TEXT PRIMARY KEY,
+            person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+            value_type TEXT NOT NULL,
+            description TEXT NOT NULL,
+            score INTEGER NOT NULL DEFAULT 50,
+            evidence TEXT,
+            source TEXT,
+            source_ref TEXT,
+            confidence REAL NOT NULL DEFAULT 0.5,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_connection_values_unique
+            ON connection_values(person_id, value_type, description);
+
+        CREATE INDEX IF NOT EXISTS idx_connection_values_type_score
+            ON connection_values(value_type, score);
 
         CREATE TABLE IF NOT EXISTS relationships (
             id TEXT PRIMARY KEY,
@@ -163,6 +187,16 @@ def init_db(con: sqlite3.Connection) -> None:
             confidence REAL NOT NULL DEFAULT 0.5,
             observed_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS source_runs (
+            id TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            source_ref TEXT,
+            status TEXT NOT NULL,
+            stats_json TEXT,
+            started_at TEXT NOT NULL,
+            finished_at TEXT NOT NULL
+        );
         """
     )
     con.commit()
@@ -183,6 +217,15 @@ def _clean(value: str | None) -> str | None:
     return value or None
 
 
+def _clean_handle(value: str | None) -> str | None:
+    value = _clean(value)
+    if not value:
+        return None
+    if value.startswith("https://x.com/") or value.startswith("https://twitter.com/"):
+        value = value.rstrip("/").split("/")[-1]
+    return value.lstrip("@").strip().lower() or None
+
+
 def upsert_person(
     con: sqlite3.Connection,
     *,
@@ -190,6 +233,7 @@ def upsert_person(
     email: str | None = None,
     phone: str | None = None,
     linkedin_url: str | None = None,
+    twitter_handle: str | None = None,
     location: str | None = None,
     notes: str | None = None,
     confidence: float = 0.5,
@@ -198,6 +242,7 @@ def upsert_person(
     email = _clean(email.lower() if email else None)
     phone = _clean(phone)
     linkedin_url = _clean(linkedin_url)
+    twitter_handle = _clean_handle(twitter_handle)
     location = _clean(location)
     notes = _clean(notes)
 
@@ -212,6 +257,11 @@ def upsert_person(
             "SELECT * FROM people WHERE linkedin_url = ?",
             (linkedin_url,),
         ).fetchone()
+    if row is None and twitter_handle:
+        row = con.execute(
+            "SELECT * FROM people WHERE lower(twitter_handle) = lower(?)",
+            (twitter_handle,),
+        ).fetchone()
     if row is None:
         row = con.execute(
             "SELECT * FROM people WHERE lower(full_name) = lower(?) AND primary_email IS NULL",
@@ -224,12 +274,12 @@ def upsert_person(
         con.execute(
             """
             INSERT INTO people (
-                id, full_name, primary_email, phone, linkedin_url, location, notes,
+                id, full_name, primary_email, phone, linkedin_url, twitter_handle, location, notes,
                 confidence, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (person_id, full_name, email, phone, linkedin_url, location, notes, confidence, ts, ts),
+            (person_id, full_name, email, phone, linkedin_url, twitter_handle, location, notes, confidence, ts, ts),
         )
         con.execute(
             """
@@ -249,6 +299,7 @@ def upsert_person(
                primary_email = COALESCE(primary_email, ?),
                phone = COALESCE(phone, ?),
                linkedin_url = COALESCE(linkedin_url, ?),
+               twitter_handle = COALESCE(twitter_handle, ?),
                location = COALESCE(location, ?),
                notes = CASE
                    WHEN ? IS NULL THEN notes
@@ -265,6 +316,7 @@ def upsert_person(
             email,
             phone,
             linkedin_url,
+            twitter_handle,
             location,
             notes,
             notes,
@@ -376,6 +428,98 @@ def add_resource(
     return resource_id
 
 
+def add_connection_value(
+    con: sqlite3.Connection,
+    *,
+    person_id: str,
+    value_type: str,
+    description: str,
+    score: int = 50,
+    evidence: str | None = None,
+    source: str | None = None,
+    source_ref: str | None = None,
+    confidence: float = 0.5,
+) -> str:
+    value_type = (_clean(value_type) or "unknown").lower()
+    description = _clean(description) or "Unspecified value"
+    evidence = _clean(evidence)
+    score = max(0, min(100, int(score)))
+    ts = now_iso()
+    row = con.execute(
+        """
+        SELECT id, evidence FROM connection_values
+         WHERE person_id = ? AND value_type = ? AND description = ?
+        """,
+        (person_id, value_type, description),
+    ).fetchone()
+    if row:
+        merged_evidence = row["evidence"]
+        if evidence and (not merged_evidence or evidence not in merged_evidence):
+            merged_evidence = f"{merged_evidence}\n{evidence}" if merged_evidence else evidence
+        con.execute(
+            """
+            UPDATE connection_values
+               SET score = MAX(score, ?),
+                   evidence = ?,
+                   source = COALESCE(source, ?),
+                   source_ref = COALESCE(source_ref, ?),
+                   confidence = MAX(confidence, ?),
+                   updated_at = ?
+             WHERE id = ?
+            """,
+            (score, merged_evidence, source, source_ref, confidence, ts, row["id"]),
+        )
+        con.commit()
+        return str(row["id"])
+
+    value_id = new_id()
+    con.execute(
+        """
+        INSERT INTO connection_values (
+            id, person_id, value_type, description, score, evidence,
+            source, source_ref, confidence, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (value_id, person_id, value_type, description, score, evidence, source, source_ref, confidence, ts),
+    )
+    con.commit()
+    return value_id
+
+
+def list_connection_values(
+    con: sqlite3.Connection,
+    *,
+    value_type: str | None = None,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    params: list[Any] = []
+    where = ""
+    if value_type:
+        where = "WHERE connection_values.value_type = ?"
+        params.append(value_type)
+    query = f"""
+        SELECT
+            connection_values.*,
+            people.full_name,
+            people.primary_email,
+            people.linkedin_url,
+            people.twitter_handle,
+            group_concat(DISTINCT organizations.name) AS organizations
+          FROM connection_values
+          JOIN people ON people.id = connection_values.person_id
+          LEFT JOIN roles ON roles.person_id = people.id
+          LEFT JOIN organizations ON organizations.id = roles.organization_id
+          {where}
+         GROUP BY connection_values.id
+         ORDER BY connection_values.score DESC, connection_values.updated_at DESC
+    """
+    if limit:
+        query += " LIMIT ?"
+        params.append(limit)
+    return rows_to_dicts(con.execute(query, params).fetchall())
+
+
 def add_interaction(
     con: sqlite3.Connection,
     *,
@@ -482,6 +626,29 @@ def add_source_fact(
     )
     con.commit()
     return fact_id
+
+
+def record_source_run(
+    con: sqlite3.Connection,
+    *,
+    source: str,
+    source_ref: str | None,
+    status: str,
+    stats: dict[str, Any] | None = None,
+) -> str:
+    run_id = new_id()
+    ts = now_iso()
+    con.execute(
+        """
+        INSERT INTO source_runs (
+            id, source, source_ref, status, stats_json, started_at, finished_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (run_id, source, source_ref, status, json.dumps(stats or {}, sort_keys=True), ts, ts),
+    )
+    con.commit()
+    return run_id
 
 
 def create_goal(

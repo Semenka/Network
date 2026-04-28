@@ -6,9 +6,10 @@ The first version is intentionally conservative:
 
 - Stores all personal network memory in a local SQLite database.
 - Imports LinkedIn connections from LinkedIn's official export CSV.
-- Imports Gmail metadata from Google Takeout MBOX or connector-style JSON exports.
+- Imports LinkedIn interactions, Gmail metadata, and X.com community/profile exports.
+- Maintains explicit connection-value signals: financial capital, time saving, competence, and specific knowledge.
 - Builds a mind map of people, organizations, roles, resources, interactions, goals, and drafts.
-- Produces a daily brief of high-leverage interactions.
+- Produces a daily brief of high-leverage interactions and channel-specific engagement drafts.
 - Creates draft messages only. Sending is deliberately left to an approval step.
 - Ships OpenClaw workspace assets so the system can run on a separate Mac Mini later.
 
@@ -16,6 +17,7 @@ No private contact data is committed to this repository.
 
 
 For operations guidance focused on daily interaction strategy and feedback loops, see [docs/NETWORK_HEAD_PLAYBOOK.md](docs/NETWORK_HEAD_PLAYBOOK.md).
+For advanced LinkedIn, Gmail, and X.com source modules, see [docs/SOURCE_MODULES.md](docs/SOURCE_MODULES.md).
 
 ## Quick Start
 
@@ -32,7 +34,9 @@ network-chief add-goal \
   --target-segment "AI founders, angels, funds" \
   --success-metric "5 warm investor conversations"
 network-chief import-linkedin --file exports/Connections.csv
+network-chief import-x --file exports/x_community.json --owner-handle yourhandle
 network-chief import-gmail-mbox --file exports/gmail.mbox --mailbox-owner you@example.com
+network-chief maintain-values
 network-chief brief --limit 10 --out data/today.md
 ```
 
@@ -56,11 +60,13 @@ The local database stores:
 - `organizations`: companies, funds, universities, communities.
 - `roles`: person-to-organization roles with source and confidence.
 - `resources`: capital, knowledge, labor, health, reputation, social access.
+- `connection_values`: possible value by person: financial capital, time saving, competence, specific knowledge.
 - `relationships`: warmth, trust, strength, last touch, next touch.
 - `interactions`: emails, messages, meetings, posts, notes.
 - `goals`: weekly, monthly, quarterly network goals.
 - `drafts`: proposed emails/messages/posts awaiting approval.
 - `source_facts`: auditable facts and where they came from.
+- `source_runs`: import and maintenance run history.
 
 ## Importing LinkedIn
 
@@ -79,6 +85,13 @@ The importer expects common LinkedIn columns:
 
 ```text
 First Name, Last Name, URL, Email Address, Company, Position, Connected On
+```
+
+LinkedIn interaction/message exports can also be imported:
+
+```bash
+network-chief import-linkedin-interactions --file exports/linkedin_messages.csv --owner-name "Andrey Semenov"
+network-chief prepare-linkedin-posts --topic "AI operator network" --count 3
 ```
 
 ## Importing Gmail
@@ -108,6 +121,53 @@ Expected JSON shape:
   }
 ]
 ```
+
+Create Gmail keep-alive drafts for stale high-value connections:
+
+```bash
+network-chief prepare-gmail-keepalive --limit 10
+```
+
+## Importing X.com
+
+Import tracked community accounts, profiles, tweets, or mentions from CSV/JSON/X archive-style files:
+
+```bash
+network-chief import-x --file exports/x_community.json --owner-handle yourhandle
+network-chief prepare-x-posts --topic "AI operator network" --count 3
+network-chief prepare-x-comments --topic "AI operator network" --count 5
+```
+
+Example JSON shape:
+
+```json
+[
+  {
+    "handle": "@aliceai",
+    "name": "Alice AI",
+    "bio": "AI investor and automation operator.",
+    "text": "Happy to share specific knowledge on machine learning.",
+    "date": "2026-04-27T09:00:00Z"
+  }
+]
+```
+
+## Connection Value Maintenance
+
+Refresh inferred possible value after imports:
+
+```bash
+network-chief maintain-values
+network-chief connection-values --limit 30
+network-chief connection-values --type financial_capital
+```
+
+Value types:
+
+- `financial_capital`
+- `time_saving`
+- `competence`
+- `specific_knowledge`
 
 ## Daily Brief
 

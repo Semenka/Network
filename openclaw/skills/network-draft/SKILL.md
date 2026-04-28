@@ -13,6 +13,15 @@ List drafts:
 network-chief drafts
 ```
 
+Create channel-specific drafts:
+
+```bash
+network-chief prepare-gmail-keepalive --limit 10
+network-chief prepare-linkedin-posts --count 3
+network-chief prepare-x-posts --count 3
+network-chief prepare-x-comments --count 5
+```
+
 Approve:
 
 ```bash

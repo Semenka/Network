@@ -8,7 +8,7 @@ from .db import new_id, now_iso, rows_to_dicts
 
 def choose_channel(person: dict[str, Any]) -> str:
     if person.get("primary_email"):
-        return "email"
+        return "gmail"
     if person.get("telegram_handle"):
         return "telegram"
     if person.get("whatsapp_phone") or person.get("phone"):
@@ -100,6 +100,49 @@ def create_draft(
             ts,
             ts,
         ),
+    )
+    con.commit()
+    return draft_id
+
+
+def create_custom_draft(
+    con: sqlite3.Connection,
+    *,
+    channel: str,
+    body: str,
+    subject: str | None = None,
+    rationale: str | None = None,
+    person_id: str | None = None,
+    goal_id: str | None = None,
+    status: str = "draft",
+) -> str:
+    ts = now_iso()
+    existing = con.execute(
+        """
+        SELECT id FROM drafts
+         WHERE COALESCE(person_id, '') = COALESCE(?, '')
+           AND COALESCE(goal_id, '') = COALESCE(?, '')
+           AND channel = ?
+           AND COALESCE(subject, '') = COALESCE(?, '')
+           AND body = ?
+           AND status = 'draft'
+           AND substr(created_at, 1, 10) = ?
+        """,
+        (person_id, goal_id, channel, subject or "", body, ts[:10]),
+    ).fetchone()
+    if existing:
+        return str(existing["id"])
+
+    draft_id = new_id()
+    con.execute(
+        """
+        INSERT INTO drafts (
+            id, person_id, goal_id, channel, subject, body, rationale,
+            status, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (draft_id, person_id, goal_id, channel, subject, body, rationale, status, ts, ts),
     )
     con.commit()
     return draft_id

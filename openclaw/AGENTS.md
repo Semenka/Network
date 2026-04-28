@@ -13,6 +13,12 @@ Use the local repository commands first:
 
 ```bash
 network-chief brief --limit 10 --out data/today.md
+network-chief maintain-values
+network-chief connection-values --limit 30
+network-chief prepare-gmail-keepalive --limit 10
+network-chief prepare-linkedin-posts --count 3
+network-chief prepare-x-posts --count 3
+network-chief prepare-x-comments --count 5
 network-chief drafts
 network-chief approve-draft --id <id>
 network-chief mindmap --out data/network-map.json

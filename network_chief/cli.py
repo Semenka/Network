@@ -5,10 +5,13 @@ import sys
 from pathlib import Path
 
 from .brief import build_daily_brief, mindmap_json
-from .db import connect, create_goal, init_db, list_goals
+from .db import connect, create_goal, init_db, list_connection_values, list_goals, record_source_run
 from .drafts import list_drafts, set_draft_status
+from .engagement import prepare_gmail_keepalive, prepare_linkedin_posts, prepare_x_comments, prepare_x_posts
 from .importers.gmail import import_gmail_json, import_gmail_mbox
-from .importers.linkedin import import_connections
+from .importers.linkedin import import_connections, import_linkedin_interactions
+from .importers.x import import_x_export
+from .value import maintain_connection_values
 
 
 def _connection(path: str | None):
@@ -37,6 +40,11 @@ def build_parser() -> argparse.ArgumentParser:
     linkedin = sub.add_parser("import-linkedin", help="Import LinkedIn official Connections.csv export.")
     linkedin.add_argument("--file", required=True, help="Path to LinkedIn Connections.csv.")
 
+    linkedin_interactions = sub.add_parser("import-linkedin-interactions", help="Import LinkedIn message/interactions CSV or JSON export.")
+    linkedin_interactions.add_argument("--file", required=True, help="Path to LinkedIn messages/interactions export.")
+    linkedin_interactions.add_argument("--owner-name", help="Your LinkedIn display name, used to classify incoming/outgoing.")
+    linkedin_interactions.add_argument("--limit", type=int, help="Optional import limit.")
+
     gmail_json = sub.add_parser("import-gmail-json", help="Import connector-style Gmail JSON export.")
     gmail_json.add_argument("--file", required=True, help="Path to Gmail JSON file.")
     gmail_json.add_argument("--mailbox-owner", help="Your email address, used to classify incoming/outgoing.")
@@ -47,10 +55,30 @@ def build_parser() -> argparse.ArgumentParser:
     gmail_mbox.add_argument("--mailbox-owner", help="Your email address, used to classify incoming/outgoing.")
     gmail_mbox.add_argument("--limit", type=int, help="Optional import limit.")
 
+    x_import = sub.add_parser("import-x", help="Import X.com community, following, tweet, or interaction CSV/JSON export.")
+    x_import.add_argument("--file", required=True, help="Path to X export CSV/JSON/JS file.")
+    x_import.add_argument("--owner-handle", help="Your X handle, used to skip yourself.")
+    x_import.add_argument("--limit", type=int, help="Optional import limit.")
+
     goal = sub.add_parser("add-goal", help="Create a weekly, monthly, or quarterly network goal.")
     goal.add_argument("--title", required=True)
     goal.add_argument("--cadence", required=True, choices=["weekly", "monthly", "quarterly"])
-    goal.add_argument("--capital-type", choices=["financial", "human", "health", "knowledge", "labor", "reputation", "social"])
+    goal.add_argument(
+        "--capital-type",
+        choices=[
+            "financial",
+            "financial_capital",
+            "human",
+            "health",
+            "knowledge",
+            "specific_knowledge",
+            "labor",
+            "time_saving",
+            "competence",
+            "reputation",
+            "social",
+        ],
+    )
     goal.add_argument("--target-segment")
     goal.add_argument("--success-metric")
     goal.add_argument("--starts-on")
@@ -66,6 +94,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     drafts = sub.add_parser("drafts", help="List drafts.")
     drafts.add_argument("--status", default="draft", help="Draft status or 'all'.")
+
+    values = sub.add_parser("connection-values", help="List inferred possible value for connections.")
+    values.add_argument("--type", help="Filter by value type.")
+    values.add_argument("--limit", type=int, default=25)
+
+    maintain = sub.add_parser("maintain-values", help="Recompute possible value signals from stored connection evidence.")
+    maintain.add_argument("--limit", type=int, help="Optional person scan limit.")
+
+    gmail_keepalive = sub.add_parser("prepare-gmail-keepalive", help="Create Gmail drafts for stale, high-value connections.")
+    gmail_keepalive.add_argument("--limit", type=int, default=10)
+
+    linkedin_posts = sub.add_parser("prepare-linkedin-posts", help="Create professional LinkedIn post drafts.")
+    linkedin_posts.add_argument("--topic")
+    linkedin_posts.add_argument("--count", type=int, default=3)
+
+    x_posts = sub.add_parser("prepare-x-posts", help="Create X.com post drafts for community engagement.")
+    x_posts.add_argument("--topic")
+    x_posts.add_argument("--count", type=int, default=3)
+
+    x_comments = sub.add_parser("prepare-x-comments", help="Create X.com comment angle drafts for tracked accounts.")
+    x_comments.add_argument("--topic")
+    x_comments.add_argument("--count", type=int, default=5)
 
     approve = sub.add_parser("approve-draft", help="Mark a draft as approved.")
     approve.add_argument("--id", required=True)
@@ -89,16 +139,31 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "import-linkedin":
         stats = import_connections(con, args.file)
+        record_source_run(con, source="linkedin_connections", source_ref=args.file, status="ok", stats=stats)
+        print(stats)
+        return 0
+
+    if args.command == "import-linkedin-interactions":
+        stats = import_linkedin_interactions(con, args.file, owner_name=args.owner_name, limit=args.limit)
+        record_source_run(con, source="linkedin_interactions", source_ref=args.file, status="ok", stats=stats)
         print(stats)
         return 0
 
     if args.command == "import-gmail-json":
         stats = import_gmail_json(con, args.file, mailbox_owner=args.mailbox_owner, limit=args.limit)
+        record_source_run(con, source="gmail_json", source_ref=args.file, status="ok", stats=stats)
         print(stats)
         return 0
 
     if args.command == "import-gmail-mbox":
         stats = import_gmail_mbox(con, args.file, mailbox_owner=args.mailbox_owner, limit=args.limit)
+        record_source_run(con, source="gmail_mbox", source_ref=args.file, status="ok", stats=stats)
+        print(stats)
+        return 0
+
+    if args.command == "import-x":
+        stats = import_x_export(con, args.file, owner_handle=args.owner_handle, limit=args.limit)
+        record_source_run(con, source="x_export", source_ref=args.file, status="ok", stats=stats)
         print(stats)
         return 0
 
@@ -130,6 +195,38 @@ def main(argv: list[str] | None = None) -> int:
         status = None if args.status == "all" else args.status
         for draft in list_drafts(con, status=status):
             print(f"{draft['id']} | {draft['status']} | {draft['channel']} | {draft.get('full_name') or 'unknown'} | {draft.get('subject') or ''}")
+        return 0
+
+    if args.command == "connection-values":
+        for value in list_connection_values(con, value_type=args.type, limit=args.limit):
+            handle = f"@{value['twitter_handle']}" if value.get("twitter_handle") else value.get("primary_email") or ""
+            print(f"{value['score']:3d} | {value['value_type']} | {value['full_name']} | {handle} | {value['description']}")
+        return 0
+
+    if args.command == "maintain-values":
+        stats = maintain_connection_values(con, limit=args.limit)
+        record_source_run(con, source="value_maintenance", source_ref=None, status="ok", stats=stats)
+        print(stats)
+        return 0
+
+    if args.command == "prepare-gmail-keepalive":
+        for draft_id in prepare_gmail_keepalive(con, limit=args.limit):
+            print(draft_id)
+        return 0
+
+    if args.command == "prepare-linkedin-posts":
+        for draft_id in prepare_linkedin_posts(con, topic=args.topic, count=args.count):
+            print(draft_id)
+        return 0
+
+    if args.command == "prepare-x-posts":
+        for draft_id in prepare_x_posts(con, topic=args.topic, count=args.count):
+            print(draft_id)
+        return 0
+
+    if args.command == "prepare-x-comments":
+        for draft_id in prepare_x_comments(con, topic=args.topic, count=args.count):
+            print(draft_id)
         return 0
 
     if args.command == "approve-draft":

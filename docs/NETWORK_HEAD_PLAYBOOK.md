@@ -2,6 +2,8 @@
 
 This playbook is for running your "head of network" agent on your Mac Mini with OpenClaw as the orchestration layer and `network-chief` as local memory/decision support.
 
+For source-specific LinkedIn, Gmail, and X.com import/draft commands, see [SOURCE_MODULES.md](SOURCE_MODULES.md).
+
 ## 1) What to review daily (operator cockpit)
 
 Run each morning:
@@ -148,4 +150,3 @@ Recommended cadence on Mac Mini:
 - Keep personal data local (`data/`, `exports/`, `.env`).
 - Tag inferred facts and confidence separately from verified facts.
 - Keep monthly privacy reviews for channel connectors and OAuth scopes.
-

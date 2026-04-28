@@ -9,7 +9,8 @@ from email.utils import getaddresses, parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
-from ..db import add_interaction, add_source_fact, upsert_person
+from ..db import add_connection_value, add_interaction, add_source_fact, upsert_person
+from ..scoring import infer_connection_values_from_text
 
 
 def _parse_date(value: str | None) -> str | None:
@@ -96,7 +97,7 @@ def import_gmail_json(
     limit: int | None = None,
 ) -> dict[str, int]:
     owner = mailbox_owner.lower() if mailbox_owner else None
-    seen_people = interactions = 0
+    seen_people = interactions = values = 0
     records = _message_records_from_json(path)
     if limit:
         records = records[:limit]
@@ -138,8 +139,21 @@ def import_gmail_json(
                 source_ref=source_ref,
                 confidence=0.65,
             )
+            for value_type, description, score in infer_connection_values_from_text(" ".join(str(part or "") for part in (subject, snippet))):
+                add_connection_value(
+                    con,
+                    person_id=person_id,
+                    value_type=value_type,
+                    description=description,
+                    score=score,
+                    evidence=str(snippet)[:500] if snippet else str(subject or ""),
+                    source="gmail_json",
+                    source_ref=source_ref,
+                    confidence=0.35,
+                )
+                values += 1
             interactions += 1
-    return {"people_seen": seen_people, "interactions_seen": interactions}
+    return {"people_seen": seen_people, "interactions_seen": interactions, "values_seen": values}
 
 
 def import_gmail_mbox(
@@ -151,7 +165,7 @@ def import_gmail_mbox(
 ) -> dict[str, int]:
     owner = mailbox_owner.lower() if mailbox_owner else None
     box = mailbox.mbox(path)
-    seen_people = interactions = 0
+    seen_people = interactions = values = 0
     for index, message in enumerate(box):
         if limit and index >= limit:
             break
@@ -191,5 +205,18 @@ def import_gmail_mbox(
                 source_ref=str(source_ref),
                 confidence=0.65,
             )
+            for value_type, description, score in infer_connection_values_from_text(" ".join(str(part or "") for part in (subject, preview))):
+                add_connection_value(
+                    con,
+                    person_id=person_id,
+                    value_type=value_type,
+                    description=description,
+                    score=score,
+                    evidence=preview[:500] if preview else str(subject or ""),
+                    source="gmail_mbox",
+                    source_ref=str(source_ref),
+                    confidence=0.35,
+                )
+                values += 1
             interactions += 1
-    return {"people_seen": seen_people, "interactions_seen": interactions}
+    return {"people_seen": seen_people, "interactions_seen": interactions, "values_seen": values}
