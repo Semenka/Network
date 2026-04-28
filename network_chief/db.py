@@ -197,6 +197,23 @@ def init_db(con: sqlite3.Connection) -> None:
             started_at TEXT NOT NULL,
             finished_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS oauth_tokens (
+            id TEXT PRIMARY KEY,
+            provider TEXT NOT NULL,
+            account TEXT NOT NULL,
+            access_token TEXT NOT NULL,
+            refresh_token TEXT,
+            token_type TEXT NOT NULL DEFAULT 'Bearer',
+            scopes TEXT NOT NULL,
+            expires_at TEXT,
+            obtained_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            extra_json TEXT
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_tokens_provider_account
+            ON oauth_tokens(provider, lower(account));
         """
     )
     con.commit()
