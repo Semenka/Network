@@ -62,6 +62,8 @@ def auth_x(
     client_secret: str | None = None,
     scopes: str | None = None,
     open_browser: bool = True,
+    manual: bool = False,
+    redirect_url: str | None = None,
 ) -> dict[str, Any]:
     cid = client_id or os.environ.get("X_CLIENT_ID")
     csec = client_secret if client_secret is not None else os.environ.get("X_CLIENT_SECRET") or None
@@ -71,7 +73,13 @@ def auth_x(
             f"and add redirect URI http://127.0.0.1:{_port()}/callback"
         )
     flow = _flow(cid, csec, port=_port(), scopes=scopes or DEFAULT_SCOPES)
-    token = flow.authorize_blocking(open_browser=open_browser)
+    if redirect_url:
+        token = flow.authorize_finish(redirect_url)
+    elif manual:
+        info = flow.authorize_start()
+        return {"manual_step": "open_url", **info}
+    else:
+        token = flow.authorize_blocking(open_browser=open_browser)
     me = request_json(
         "GET",
         ME_URL,

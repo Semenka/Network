@@ -69,6 +69,8 @@ def auth_linkedin_owner(
     client_id: str | None = None,
     client_secret: str | None = None,
     open_browser: bool = True,
+    manual: bool = False,
+    redirect_url: str | None = None,
 ) -> dict[str, Any]:
     cid = client_id or os.environ.get("LINKEDIN_CLIENT_ID")
     csec = client_secret or os.environ.get("LINKEDIN_CLIENT_SECRET")
@@ -79,7 +81,13 @@ def auth_linkedin_owner(
             f"http://127.0.0.1:{_port()}/callback. Request the 'Sign In with LinkedIn using OpenID Connect' product."
         )
     flow = _flow(cid, csec, port=_port(), scopes=OIDC_SCOPES)
-    token = flow.authorize_blocking(open_browser=open_browser)
+    if redirect_url:
+        token = flow.authorize_finish(redirect_url)
+    elif manual:
+        info = flow.authorize_start()
+        return {"manual_step": "open_url", **info}
+    else:
+        token = flow.authorize_blocking(open_browser=open_browser)
     info = request_json(
         "GET",
         USERINFO_URL,

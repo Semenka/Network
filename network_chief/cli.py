@@ -142,17 +142,23 @@ def build_parser() -> argparse.ArgumentParser:
     auth_g.add_argument("--client-secret")
     auth_g.add_argument("--scopes")
     auth_g.add_argument("--no-browser", action="store_true", help="Print URL only, don't open a browser.")
+    auth_g.add_argument("--manual", action="store_true", help="Skip the loopback server. Prints URL; finish with --redirect-url.")
+    auth_g.add_argument("--redirect-url", help="Paste the full URL your browser was redirected to (after a --manual start).")
 
     auth_x_p = sub.add_parser("auth-x", help="Authorize X.com (OAuth 2.0 PKCE). Browser-based.")
     auth_x_p.add_argument("--client-id")
     auth_x_p.add_argument("--client-secret")
     auth_x_p.add_argument("--scopes")
     auth_x_p.add_argument("--no-browser", action="store_true")
+    auth_x_p.add_argument("--manual", action="store_true")
+    auth_x_p.add_argument("--redirect-url")
 
     auth_li = sub.add_parser("auth-linkedin", help="Authorize LinkedIn (OIDC owner identity).")
     auth_li.add_argument("--client-id")
     auth_li.add_argument("--client-secret")
     auth_li.add_argument("--no-browser", action="store_true")
+    auth_li.add_argument("--manual", action="store_true")
+    auth_li.add_argument("--redirect-url")
 
     sub.add_parser("auth-status", help="List stored OAuth tokens (no secrets shown).")
 
@@ -308,10 +314,17 @@ def main(argv: list[str] | None = None) -> int:
                 client_secret=args.client_secret,
                 scopes=args.scopes,
                 open_browser=not args.no_browser,
+                manual=args.manual,
+                redirect_url=args.redirect_url,
             )
         except (AuthRequired, OAuthError) as exc:
             print(f"auth-google failed: {exc}", file=sys.stderr)
             return 2
+        if result.get("manual_step") == "open_url":
+            print(f"[google] Open this URL in your browser, then paste the resulting redirect URL:")
+            print(result["authorize_url"])
+            print(f"[google] Finish with: network-chief auth-google --redirect-url '<paste here>'")
+            return 0
         print(f"google authorized: {result['account']} (scopes={result.get('scopes', '')})")
         return 0
 
@@ -323,10 +336,17 @@ def main(argv: list[str] | None = None) -> int:
                 client_secret=args.client_secret,
                 scopes=args.scopes,
                 open_browser=not args.no_browser,
+                manual=args.manual,
+                redirect_url=args.redirect_url,
             )
         except (AuthRequired, OAuthError) as exc:
             print(f"auth-x failed: {exc}", file=sys.stderr)
             return 2
+        if result.get("manual_step") == "open_url":
+            print(f"[x] Open this URL in your browser, then paste the resulting redirect URL:")
+            print(result["authorize_url"])
+            print(f"[x] Finish with: network-chief auth-x --redirect-url '<paste here>'")
+            return 0
         print(f"x authorized: @{result['account']} (user_id={result.get('user_id')})")
         return 0
 
@@ -337,10 +357,17 @@ def main(argv: list[str] | None = None) -> int:
                 client_id=args.client_id,
                 client_secret=args.client_secret,
                 open_browser=not args.no_browser,
+                manual=args.manual,
+                redirect_url=args.redirect_url,
             )
         except (AuthRequired, OAuthError) as exc:
             print(f"auth-linkedin failed: {exc}", file=sys.stderr)
             return 2
+        if result.get("manual_step") == "open_url":
+            print(f"[linkedin] Open this URL in your browser, then paste the resulting redirect URL:")
+            print(result["authorize_url"])
+            print(f"[linkedin] Finish with: network-chief auth-linkedin --redirect-url '<paste here>'")
+            return 0
         print(f"linkedin authorized: {result['account']} ({result.get('name')})")
         return 0
 

@@ -89,6 +89,8 @@ def auth_google(
     client_secret: str | None = None,
     scopes: str | None = None,
     open_browser: bool = True,
+    manual: bool = False,
+    redirect_url: str | None = None,
 ) -> dict[str, Any]:
     """Run the Google OAuth flow and persist the resulting token."""
     cid = client_id or os.environ.get("GOOGLE_CLIENT_ID")
@@ -100,7 +102,13 @@ def auth_google(
             f"http://127.0.0.1:{_port()}/callback"
         )
     flow = _flow(cid, csec, port=_port(), scopes=scopes or DEFAULT_SCOPES)
-    token = flow.authorize_blocking(open_browser=open_browser)
+    if redirect_url:
+        token = flow.authorize_finish(redirect_url)
+    elif manual:
+        info = flow.authorize_start()
+        return {"manual_step": "open_url", **info}
+    else:
+        token = flow.authorize_blocking(open_browser=open_browser)
     account = _decode_id_token_email(token.get("id_token")) or "google"
     if account == "google":
         try:

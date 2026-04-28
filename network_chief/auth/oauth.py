@@ -3,15 +3,20 @@ from __future__ import annotations
 import base64
 import hashlib
 import http.server
+import json
 import secrets
 import threading
 import urllib.parse
 import webbrowser
+from pathlib import Path
 from typing import Any
 
 from .errors import LoopbackServerError, OAuthError
 from .http_util import request_json
 from .tokens import expires_at_from_seconds
+
+
+PENDING_DIR = Path("data/auth/pending")
 
 
 def _b64url_no_pad(data: bytes) -> str:
@@ -157,6 +162,75 @@ class OAuthFlow:
         token = self._exchange_code(code, verifier)
         token.setdefault("scope", self.scopes)
         token["_expires_at"] = expires_at_from_seconds(token.get("expires_in"))
+        return token
+
+    def authorize_start(self) -> dict[str, str]:
+        """Begin a manual flow: persist PKCE state to disk, return the auth URL.
+
+        Pair with :meth:`authorize_finish` after the user pastes the redirect URL.
+        """
+        verifier, challenge = pkce_pair() if self.use_pkce else ("", "")
+        state = secrets.token_urlsafe(32)
+        params: dict[str, Any] = {
+            "response_type": "code",
+            "client_id": self.client_id,
+            "redirect_uri": self.redirect_uri,
+            "scope": self.scopes,
+            "state": state,
+        }
+        if self.use_pkce:
+            params["code_challenge"] = challenge
+            params["code_challenge_method"] = "S256"
+        params.update(self.extra_auth_params)
+        authorize_url = f"{self.auth_url}?{urllib.parse.urlencode(params)}"
+
+        PENDING_DIR.mkdir(parents=True, exist_ok=True)
+        path = PENDING_DIR / f"{self.provider}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "verifier": verifier,
+                    "state": state,
+                    "client_id": self.client_id,
+                    "redirect_uri": self.redirect_uri,
+                    "scopes": self.scopes,
+                }
+            )
+        )
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+        return {"authorize_url": authorize_url, "state_path": str(path)}
+
+    def authorize_finish(self, redirect_url: str) -> dict[str, Any]:
+        """Complete a manual flow by parsing the redirect URL the user pasted."""
+        path = PENDING_DIR / f"{self.provider}.json"
+        if not path.exists():
+            raise OAuthError(
+                f"{self.provider}: no pending auth state. Run with --manual first to start the flow."
+            )
+        pending = json.loads(path.read_text())
+        # Accept either a full URL or a bare query string.
+        parsed = urllib.parse.urlparse(redirect_url.strip())
+        query = parsed.query or parsed.path
+        params = dict(urllib.parse.parse_qsl(query))
+        if params.get("error"):
+            raise OAuthError(
+                f"{self.provider}: {params['error']} {params.get('error_description', '')}".strip()
+            )
+        if params.get("state") != pending["state"]:
+            raise OAuthError(f"{self.provider}: state mismatch (CSRF check failed)")
+        code = params.get("code")
+        if not code:
+            raise OAuthError(f"{self.provider}: no code in redirect URL")
+        token = self._exchange_code(code, pending.get("verifier", ""))
+        token.setdefault("scope", self.scopes)
+        token["_expires_at"] = expires_at_from_seconds(token.get("expires_in"))
+        try:
+            path.unlink()
+        except OSError:
+            pass
         return token
 
     def refresh(self, refresh_token: str) -> dict[str, Any]:
