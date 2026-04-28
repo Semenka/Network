@@ -14,6 +14,9 @@ The first version is intentionally conservative:
 
 No private contact data is committed to this repository.
 
+
+For operations guidance focused on daily interaction strategy and feedback loops, see [docs/NETWORK_HEAD_PLAYBOOK.md](docs/NETWORK_HEAD_PLAYBOOK.md).
+
 ## Quick Start
 
 ```bash
