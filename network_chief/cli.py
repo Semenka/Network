@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
 from .auth.errors import AuthRequired, OAuthError, RateLimited
 from .auth.tokens import TokenStore
 from .brief import build_daily_brief, mindmap_json
+from .dashboard import compute_dashboard, previous_snapshot, render_markdown, save_snapshot
 from .db import connect, create_goal, init_db, list_connection_values, list_goals, record_source_run
 from .drafts import list_drafts, set_draft_status
 from .engagement import prepare_gmail_keepalive, prepare_linkedin_posts, prepare_x_comments, prepare_x_posts
@@ -184,6 +186,12 @@ def build_parser() -> argparse.ArgumentParser:
     sync_li.add_argument("--watch-dir", default="exports")
     sync_li.add_argument("--timeout", type=int, default=900)
     sync_li.add_argument("--no-browser", action="store_true")
+
+    dash = sub.add_parser("dashboard", help="Render performance dashboard with deltas vs previous snapshot.")
+    dash.add_argument("--window", type=int, default=30, help="Time window in days (default 30).")
+    dash.add_argument("--out", help="Write markdown to a file.")
+    dash.add_argument("--json", dest="json_out", help="Also write the raw JSON snapshot to this path.")
+    dash.add_argument("--no-snapshot", action="store_true", help="Render only; do not persist a kpi_snapshots row.")
 
     return parser
 
@@ -426,6 +434,20 @@ def main(argv: list[str] | None = None) -> int:
         except RateLimited as exc:
             print(f"sync-x rate-limited (reset_at={exc.reset_at}): {exc}", file=sys.stderr)
             return 0
+        return 0
+
+    if args.command == "dashboard":
+        snapshot = compute_dashboard(con, window_days=args.window)
+        prev = previous_snapshot(con, window_days=args.window)
+        if not args.no_snapshot:
+            save_snapshot(con, snapshot)
+        markdown = render_markdown(snapshot, previous=prev)
+        _write_or_print(markdown, args.out)
+        if args.json_out:
+            output = Path(args.json_out)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(snapshot, indent=2, sort_keys=True), encoding="utf-8")
+            print(f"Wrote {output}")
         return 0
 
     if args.command == "sync-linkedin":

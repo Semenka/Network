@@ -214,6 +214,16 @@ def init_db(con: sqlite3.Connection) -> None:
 
         CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_tokens_provider_account
             ON oauth_tokens(provider, lower(account));
+
+        CREATE TABLE IF NOT EXISTS kpi_snapshots (
+            id TEXT PRIMARY KEY,
+            captured_at TEXT NOT NULL,
+            window_days INTEGER NOT NULL,
+            metrics_json TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_kpi_snapshots_window_time
+            ON kpi_snapshots(window_days, captured_at DESC);
         """
     )
     con.commit()
