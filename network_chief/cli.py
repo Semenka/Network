@@ -9,6 +9,7 @@ from pathlib import Path
 from .auth.errors import AuthRequired, OAuthError, RateLimited
 from .auth.tokens import TokenStore
 from .brief import build_daily_brief, mindmap_json
+from .cleanup import delete_people, find_misclassified
 from .dashboard import compute_dashboard, previous_snapshot, render_markdown, save_snapshot
 from .db import connect, create_goal, db_path_from_env, init_db, list_connection_values, list_goals, record_source_run
 from .graph import render_graph_markdown
@@ -18,6 +19,7 @@ from .importers.gmail import import_gmail_json, import_gmail_mbox
 from .importers.google_api import (
     auth_google,
     download_drive_file,
+    push_drafts_to_gmail,
     revoke_google,
     sync_gmail_messages,
     sync_google_contacts,
@@ -211,6 +213,20 @@ def build_parser() -> argparse.ArgumentParser:
     graph.add_argument("--limit", type=int, default=40)
     graph.add_argument("--out", help="Write the Mermaid markdown to a file.")
 
+    cleanup = sub.add_parser(
+        "cleanup-people",
+        help="Find (and optionally delete) person rows whose full_name is an email, domain, or org name.",
+    )
+    cleanup.add_argument("--delete", action="store_true", help="Actually delete; default is dry-run.")
+    cleanup.add_argument("--limit", type=int, help="Only show/delete the first N candidates.")
+
+    push = sub.add_parser(
+        "push-drafts",
+        help="Push pending network-chief drafts into the user's Gmail Drafts (read-and-write Google scope required).",
+    )
+    push.add_argument("--limit", type=int, help="Cap on how many drafts to push.")
+    push.add_argument("--status", default="draft", help="Local draft status to filter on (default: draft).")
+
     drv = sub.add_parser(
         "import-drive",
         help="Download a Google Drive file via the saved Google token and ingest it.",
@@ -249,6 +265,8 @@ _STATE_CHANGING_COMMANDS = frozenset(
         "approve-draft",
         "reject-draft",
         "add-goal",
+        "cleanup-people",
+        "push-drafts",
     }
 )
 
@@ -546,6 +564,39 @@ def _dispatch(args, con) -> int:
     if args.command == "graph":
         markdown = render_graph_markdown(con, limit=args.limit)
         _write_or_print(markdown, args.out)
+        return 0
+
+    if args.command == "push-drafts":
+        try:
+            stats = push_drafts_to_gmail(con, status=args.status, limit=args.limit)
+        except AuthRequired as exc:
+            print(f"push-drafts: {exc}", file=sys.stderr)
+            return 2
+        record_source_run(con, source="gmail_drafts_push", source_ref=None, status="ok", stats={
+            "pushed": stats["pushed"], "skipped": stats["skipped"], "errors": len(stats["errors"]),
+        })
+        for item in stats["items"]:
+            print(f"  pushed: {item['name']} <{item['to']}> → gmail_draft={item['gmail_draft_id']}")
+        for err in stats["errors"]:
+            print(f"  skipped: {err}", file=sys.stderr)
+        print(f"\n{stats['pushed']} drafts pushed to Gmail; {stats['skipped']} skipped.")
+        return 0
+
+    if args.command == "cleanup-people":
+        candidates = find_misclassified(con)
+        if args.limit:
+            candidates = candidates[: args.limit]
+        if not candidates:
+            print("No misclassified person rows found.")
+            return 0
+        for cand in candidates:
+            print(
+                f"  {cand['id'][:8]}  reason={cand['reason']:22s}  full_name={cand['full_name']!r}"
+            )
+        print(f"\n{len(candidates)} candidates", "(dry-run)" if not args.delete else "(deleting)")
+        if args.delete:
+            removed = delete_people(con, [c["id"] for c in candidates])
+            print(f"Deleted {removed} people (cascade cleaned roles/interactions/values).")
         return 0
 
     if args.command == "import-drive":

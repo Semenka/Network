@@ -44,11 +44,13 @@ REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 SCOPE_OPENID = "openid email"
 SCOPE_PEOPLE = "https://www.googleapis.com/auth/contacts.readonly"
 SCOPE_GMAIL = "https://www.googleapis.com/auth/gmail.readonly"
-DEFAULT_SCOPES = " ".join((SCOPE_OPENID, SCOPE_PEOPLE, SCOPE_GMAIL))
+SCOPE_GMAIL_COMPOSE = "https://www.googleapis.com/auth/gmail.compose"
+DEFAULT_SCOPES = " ".join((SCOPE_OPENID, SCOPE_PEOPLE, SCOPE_GMAIL, SCOPE_GMAIL_COMPOSE))
 
 PEOPLE_URL = "https://people.googleapis.com/v1/people/me/connections"
 GMAIL_LIST_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
 GMAIL_GET_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages/{id}"
+GMAIL_DRAFTS_URL = "https://gmail.googleapis.com/gmail/v1/users/me/drafts"
 DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files/{id}"
 DRIVE_EXPORT_URL = "https://www.googleapis.com/drive/v3/files/{id}/export"
 USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
@@ -432,6 +434,90 @@ def _ingest_gmail_message(con: sqlite3.Connection, message: dict[str, Any], *, o
                 confidence=0.4,
             )
     return people, interactions
+
+
+def _build_rfc2822(*, sender: str | None, to: str, subject: str, body: str) -> str:
+    """Build an RFC 2822 message and return its base64url-encoded form."""
+    from email.message import EmailMessage
+    from email.utils import formatdate, make_msgid
+
+    msg = EmailMessage()
+    msg.set_content(body, subtype="plain", charset="utf-8")
+    if sender:
+        msg["From"] = sender
+    msg["To"] = to
+    msg["Subject"] = subject
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid()
+    return base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
+
+
+def push_drafts_to_gmail(
+    con: sqlite3.Connection,
+    *,
+    status: str = "draft",
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """Push network-chief drafts (with email recipients) into Gmail Drafts.
+
+    Requires ``gmail.compose`` (or ``gmail.modify``) on the saved Google
+    token. Drafts are created as MIME messages addressed to the contact's
+    primary email; the ``From`` is the authorized Gmail account. Local
+    draft rows are NOT mutated — review/approval still happens through
+    ``approve-draft`` / ``reject-draft`` once you've decided in Gmail.
+    """
+    record = _ensure_token(con)
+    scopes = (record.get("scopes") or "").split()
+    if SCOPE_GMAIL_COMPOSE not in scopes and "https://www.googleapis.com/auth/gmail.modify" not in scopes:
+        raise AuthRequired(
+            "Saved Google token lacks gmail.compose scope. Re-run "
+            "`network-chief auth-google --manual` (DEFAULT_SCOPES now includes gmail.compose)."
+        )
+    headers = {**_authed_headers(record), "Content-Type": "application/json"}
+    sender = record.get("account") or None
+
+    rows = con.execute(
+        """
+        SELECT d.id, p.full_name, p.primary_email, d.subject, d.body
+          FROM drafts d JOIN people p ON p.id = d.person_id
+         WHERE d.status = ?
+           AND p.primary_email IS NOT NULL AND p.primary_email != ''
+         ORDER BY d.created_at
+         LIMIT ?
+        """,
+        (status, limit or 1000),
+    ).fetchall()
+
+    pushed: list[dict[str, str]] = []
+    skipped = 0
+    errors: list[str] = []
+    for row in rows:
+        try:
+            raw = _build_rfc2822(
+                sender=sender,
+                to=row["primary_email"],
+                subject=row["subject"] or "(no subject)",
+                body=row["body"] or "",
+            )
+            resp = request_json(
+                "POST",
+                GMAIL_DRAFTS_URL,
+                headers=headers,
+                json_body={"message": {"raw": raw}},
+            )
+            pushed.append(
+                {
+                    "draft_id": row["id"],
+                    "to": row["primary_email"],
+                    "name": row["full_name"],
+                    "gmail_draft_id": (resp.get("id") or ""),
+                }
+            )
+        except Exception as exc:  # pragma: no cover - reported per-draft
+            skipped += 1
+            errors.append(f"{row['full_name']}: {exc}")
+
+    return {"pushed": len(pushed), "skipped": skipped, "items": pushed, "errors": errors}
 
 
 _GOOGLE_NATIVE_EXPORTS: dict[str, tuple[str, str]] = {
