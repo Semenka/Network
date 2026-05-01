@@ -1,0 +1,69 @@
+{
+  "breadth": {
+    "identity_coverage_pct": {
+      "email": 18.8,
+      "linkedin": 0.0,
+      "phone": 85.0,
+      "twitter": 0.0
+    },
+    "new_in_window": 985,
+    "sources": [
+      {
+        "people": 866,
+        "source": "google_people"
+      },
+      {
+        "people": 120,
+        "source": "gmail_api"
+      }
+    ],
+    "total_people": 985
+  },
+  "cadence": {
+    "active_people_30d": 115,
+    "active_people_90d": 120,
+    "inbound_outbound_ratio": 6.19,
+    "incoming_90d": 365,
+    "outgoing_90d": 59,
+    "pct_active_30d": 11.7,
+    "pct_active_90d": 12.2,
+    "stale_high_value": 10,
+    "touches_30d": 388,
+    "touches_7d": 41,
+    "touches_90d": 424
+  },
+  "captured_at": "2026-05-01T20:57:38Z",
+  "goals": [],
+  "pipeline": {
+    "approval_rate_pct": 0.0,
+    "drafts_approved": 0,
+    "drafts_by_channel": [],
+    "drafts_created": 0,
+    "drafts_rejected": 0,
+    "mean_decision_hours": null,
+    "sync_runs": [
+      {
+        "last_run": "2026-04-28T23:01:21Z",
+        "runs": 1,
+        "source": "gmail_api",
+        "status": "ok"
+      },
+      {
+        "last_run": "2026-04-28T22:59:51Z",
+        "runs": 1,
+        "source": "google_people",
+        "status": "ok"
+      }
+    ]
+  },
+  "value": {
+    "by_type_score_60_plus": {
+      "competence": 10,
+      "financial_capital": 14,
+      "specific_knowledge": 17,
+      "time_saving": 3
+    },
+    "median_value_score": 78
+  },
+  "window_days": 30
+}

@@ -9,11 +9,11 @@ Use this when the user wants a periodic summary of network health and Network Ch
 
 Recommended cadence (set in cron / OpenClaw scheduler):
 
-- Daily 7:50: `network-chief dashboard --window 7 --out data/dashboard-7d.md`
-- Weekly Mon 8:05: `network-chief dashboard --window 30 --out data/dashboard-30d.md --json data/dashboard-30d.json`
-- Monthly 1st 8:10: `network-chief dashboard --window 90 --out data/dashboard-90d.md`
+- Daily 7:50: `network-chief dashboard --window 7 --out dashboards/dashboard-7d.md`
+- Weekly Mon 8:05: `network-chief dashboard --window 30 --out dashboards/dashboard-30d.md --json dashboards/dashboard-30d.json`
+- Monthly 1st 8:10: `network-chief dashboard --window 90 --out dashboards/dashboard-90d.md`
 
-Each run persists a `kpi_snapshots` row for the chosen window. The next run of the same window automatically renders deltas vs that prior snapshot.
+Each run persists a `kpi_snapshots` row for the chosen window. The next run of the same window automatically renders deltas vs that prior snapshot. The `dashboards/` directory is committed to git on purpose — see `dashboards/README.md` for the privacy trade-off if your repo is public.
 
 What to surface to the operator after each run:
 
