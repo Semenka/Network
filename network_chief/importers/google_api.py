@@ -1,7 +1,10 @@
-"""Google OAuth + People/Gmail sync.
+"""Google OAuth + People/Gmail/Drive sync.
 
 People API (``contacts.readonly``) gives us connections; Gmail API
-(``gmail.readonly``) gives us interaction signal. Both are read-only.
+(``gmail.readonly``) gives us interaction signal. The Drive API
+(``drive``) is used opportunistically — only to pull a specific file
+the user points at by id, e.g. a LinkedIn ``Connections.csv`` they
+uploaded to Drive.
 """
 
 from __future__ import annotations
@@ -9,8 +12,12 @@ from __future__ import annotations
 import base64
 import json
 import os
+import shutil
 import sqlite3
+import urllib.parse
+import urllib.request
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Iterator
 
 from ..auth.errors import AuthRequired
@@ -42,6 +49,8 @@ DEFAULT_SCOPES = " ".join((SCOPE_OPENID, SCOPE_PEOPLE, SCOPE_GMAIL))
 PEOPLE_URL = "https://people.googleapis.com/v1/people/me/connections"
 GMAIL_LIST_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
 GMAIL_GET_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages/{id}"
+DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files/{id}"
+DRIVE_EXPORT_URL = "https://www.googleapis.com/drive/v3/files/{id}/export"
 USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 
 
@@ -423,6 +432,74 @@ def _ingest_gmail_message(con: sqlite3.Connection, message: dict[str, Any], *, o
                 confidence=0.4,
             )
     return people, interactions
+
+
+_GOOGLE_NATIVE_EXPORTS: dict[str, tuple[str, str]] = {
+    # mime → (export_mime, default_extension)
+    "application/vnd.google-apps.spreadsheet": ("text/csv", ".csv"),
+    "application/vnd.google-apps.document": ("text/plain", ".txt"),
+    "application/vnd.google-apps.presentation": ("application/pdf", ".pdf"),
+}
+
+
+def _drive_url(record: dict[str, Any], file_id: str, *, export_mime: str | None) -> str:
+    if export_mime:
+        params = urllib.parse.urlencode({"mimeType": export_mime})
+        return f"{DRIVE_EXPORT_URL.format(id=file_id)}?{params}"
+    return f"{DRIVE_FILES_URL.format(id=file_id)}?{urllib.parse.urlencode({'alt': 'media'})}"
+
+
+def download_drive_file(
+    con: sqlite3.Connection,
+    *,
+    file_id: str,
+    dest: str | Path | None = None,
+    timeout: float = 120.0,
+) -> dict[str, Any]:
+    """Download a file from Google Drive using the saved OAuth token.
+
+    Google-native types (Sheets/Docs/Slides) are auto-exported via the
+    ``/export`` endpoint; everything else streams via ``alt=media``.
+    Returns metadata dict including the resolved on-disk path.
+    """
+    record = _ensure_token(con)
+    headers = _authed_headers(record)
+    meta = request_json(
+        "GET",
+        DRIVE_FILES_URL.format(id=file_id),
+        headers=headers,
+        params={"fields": "id,name,mimeType,size"},
+    )
+    name = meta.get("name") or f"drive-{file_id}"
+    mime = meta.get("mimeType") or "application/octet-stream"
+
+    export_mime: str | None = None
+    extension_hint = ""
+    if mime in _GOOGLE_NATIVE_EXPORTS:
+        export_mime, extension_hint = _GOOGLE_NATIVE_EXPORTS[mime]
+
+    if dest is None:
+        dest_path = Path("exports") / name
+        if extension_hint and dest_path.suffix.lower() != extension_hint:
+            dest_path = dest_path.with_suffix(dest_path.suffix + extension_hint)
+    else:
+        dest_path = Path(dest)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    url = _drive_url(record, file_id, export_mime=export_mime)
+    req = urllib.request.Request(url)
+    req.add_header("Authorization", f"Bearer {record['access_token']}")
+    req.add_header("User-Agent", "network-chief/0.1 (+https://github.com/Semenka/Network)")
+    with urllib.request.urlopen(req, timeout=timeout) as resp, dest_path.open("wb") as out:
+        shutil.copyfileobj(resp, out)
+
+    return {
+        "id": meta.get("id"),
+        "name": name,
+        "mime_type": mime,
+        "size_bytes": dest_path.stat().st_size,
+        "path": str(dest_path),
+    }
 
 
 def revoke_google(con: sqlite3.Connection, *, account: str | None = None) -> int:

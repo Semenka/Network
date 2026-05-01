@@ -15,7 +15,13 @@ from .graph import render_graph_markdown
 from .drafts import list_drafts, set_draft_status
 from .engagement import prepare_gmail_keepalive, prepare_linkedin_posts, prepare_x_comments, prepare_x_posts
 from .importers.gmail import import_gmail_json, import_gmail_mbox
-from .importers.google_api import auth_google, revoke_google, sync_gmail_messages, sync_google_contacts
+from .importers.google_api import (
+    auth_google,
+    download_drive_file,
+    revoke_google,
+    sync_gmail_messages,
+    sync_google_contacts,
+)
 from .importers.linkedin import import_connections, import_linkedin_interactions
 from .importers.linkedin_api import (
     LinkedInDMARequired,
@@ -205,6 +211,21 @@ def build_parser() -> argparse.ArgumentParser:
     graph.add_argument("--limit", type=int, default=40)
     graph.add_argument("--out", help="Write the Mermaid markdown to a file.")
 
+    drv = sub.add_parser(
+        "import-drive",
+        help="Download a Google Drive file via the saved Google token and ingest it.",
+    )
+    drv.add_argument("--file-id", required=True, help="Google Drive file id (the long string in the share URL).")
+    drv.add_argument("--out", help="Where to save the downloaded file (default exports/<name>).")
+    drv.add_argument(
+        "--treat-as",
+        choices=["linkedin", "linkedin-interactions", "gmail-json", "x", "none"],
+        default="linkedin",
+        help="Which importer to run after download. 'none' just downloads.",
+    )
+    drv.add_argument("--owner", help="Mailbox owner / LinkedIn handle / X handle, passed through to the importer.")
+    drv.add_argument("--limit", type=int, help="Optional row limit for the chosen importer.")
+
     return parser
 
 
@@ -215,6 +236,7 @@ _STATE_CHANGING_COMMANDS = frozenset(
         "import-gmail-json",
         "import-gmail-mbox",
         "import-x",
+        "import-drive",
         "sync-google",
         "sync-x",
         "sync-linkedin",
@@ -524,6 +546,33 @@ def _dispatch(args, con) -> int:
     if args.command == "graph":
         markdown = render_graph_markdown(con, limit=args.limit)
         _write_or_print(markdown, args.out)
+        return 0
+
+    if args.command == "import-drive":
+        try:
+            meta = download_drive_file(con, file_id=args.file_id, dest=args.out)
+        except (AuthRequired, OAuthError) as exc:
+            print(f"import-drive: {exc}", file=sys.stderr)
+            return 2
+        print(f"downloaded: {meta['name']} → {meta['path']} ({meta['size_bytes']} bytes, {meta['mime_type']})")
+
+        treat = args.treat_as
+        path = meta["path"]
+        if treat == "linkedin":
+            stats = import_connections(con, path)
+            record_source_run(con, source="linkedin_connections", source_ref=path, status="ok", stats=stats)
+        elif treat == "linkedin-interactions":
+            stats = import_linkedin_interactions(con, path, owner_name=args.owner, limit=args.limit)
+            record_source_run(con, source="linkedin_interactions", source_ref=path, status="ok", stats=stats)
+        elif treat == "gmail-json":
+            stats = import_gmail_json(con, path, mailbox_owner=args.owner, limit=args.limit)
+            record_source_run(con, source="gmail_json", source_ref=path, status="ok", stats=stats)
+        elif treat == "x":
+            stats = import_x_export(con, path, owner_handle=args.owner, limit=args.limit)
+            record_source_run(con, source="x_export", source_ref=path, status="ok", stats=stats)
+        else:
+            stats = {"status": "downloaded_only"}
+        print(stats)
         return 0
 
     if args.command == "sync-linkedin":
