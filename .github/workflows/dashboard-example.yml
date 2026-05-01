@@ -34,6 +34,7 @@ jobs:
       - name: Generate sample dashboard
         env:
           NETWORK_CHIEF_DB: /tmp/network-chief-example/network.db
+          NETWORK_CHIEF_NO_DASHBOARD: "1"
         run: |
           set -euo pipefail
           rm -rf /tmp/network-chief-example

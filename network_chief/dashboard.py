@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .db import new_id, now_iso, rows_to_dicts
+from .graph import render_graph_markdown
 
 
 def _isofmt(dt: datetime) -> str:
@@ -328,7 +329,13 @@ def _get(d: dict[str, Any] | None, *path: str) -> Any:
     return cur
 
 
-def render_markdown(snapshot: dict[str, Any], previous: dict[str, Any] | None = None) -> str:
+def render_markdown(
+    snapshot: dict[str, Any],
+    previous: dict[str, Any] | None = None,
+    *,
+    con: sqlite3.Connection | None = None,
+    graph_limit: int = 40,
+) -> str:
     out: list[str] = []
     captured = snapshot["captured_at"]
     window = snapshot["window_days"]
@@ -426,6 +433,8 @@ def render_markdown(snapshot: dict[str, Any], previous: dict[str, Any] | None = 
             )
     out.append("")
 
+    if con is not None:
+        out.append(render_graph_markdown(con, limit=graph_limit))
     out.append("## 6. How to read this")
     out.append(
         "- **Network breadth** answers Reid Hoffman's *I+1/I+2* question: are you adding new nodes, "

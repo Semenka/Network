@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -9,7 +10,8 @@ from .auth.errors import AuthRequired, OAuthError, RateLimited
 from .auth.tokens import TokenStore
 from .brief import build_daily_brief, mindmap_json
 from .dashboard import compute_dashboard, previous_snapshot, render_markdown, save_snapshot
-from .db import connect, create_goal, init_db, list_connection_values, list_goals, record_source_run
+from .db import connect, create_goal, db_path_from_env, init_db, list_connection_values, list_goals, record_source_run
+from .graph import render_graph_markdown
 from .drafts import list_drafts, set_draft_status
 from .engagement import prepare_gmail_keepalive, prepare_linkedin_posts, prepare_x_comments, prepare_x_posts
 from .importers.gmail import import_gmail_json, import_gmail_mbox
@@ -45,6 +47,11 @@ def _write_or_print(content: str, out: str | None) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="network-chief", description="Local-first chief-of-network agent.")
     parser.add_argument("--db", help="SQLite database path. Defaults to NETWORK_CHIEF_DB or data/network.db.")
+    parser.add_argument(
+        "--no-dashboard",
+        action="store_true",
+        help="Skip auto-refreshing dashboards/dashboard-30d.md after state-changing commands.",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init", help="Initialize the local database.")
@@ -192,14 +199,78 @@ def build_parser() -> argparse.ArgumentParser:
     dash.add_argument("--out", help="Write markdown to a file.")
     dash.add_argument("--json", dest="json_out", help="Also write the raw JSON snapshot to this path.")
     dash.add_argument("--no-snapshot", action="store_true", help="Render only; do not persist a kpi_snapshots row.")
+    dash.add_argument("--graph-limit", type=int, default=40, help="Top-N people in the embedded Mermaid graph.")
+
+    graph = sub.add_parser("graph", help="Render the top-N network as a Mermaid graph (renders inline on GitHub).")
+    graph.add_argument("--limit", type=int, default=40)
+    graph.add_argument("--out", help="Write the Mermaid markdown to a file.")
 
     return parser
 
 
+_STATE_CHANGING_COMMANDS = frozenset(
+    {
+        "import-linkedin",
+        "import-linkedin-interactions",
+        "import-gmail-json",
+        "import-gmail-mbox",
+        "import-x",
+        "sync-google",
+        "sync-x",
+        "sync-linkedin",
+        "maintain-values",
+        "brief",
+        "prepare-gmail-keepalive",
+        "prepare-linkedin-posts",
+        "prepare-x-posts",
+        "prepare-x-comments",
+        "approve-draft",
+        "reject-draft",
+        "add-goal",
+    }
+)
+
+
+def _maybe_auto_refresh(args, con, db_path: str) -> None:
+    """After a successful state-changing command, refresh dashboards/dashboard-30d.md.
+
+    Skipped for read-only / OAuth / dashboard commands, in-memory test DBs,
+    when --no-dashboard was passed, or when NETWORK_CHIEF_NO_DASHBOARD=1 in env.
+    """
+    if getattr(args, "no_dashboard", False):
+        return
+    if os.environ.get("NETWORK_CHIEF_NO_DASHBOARD") == "1":
+        return
+    if db_path == ":memory:":
+        return
+    if args.command not in _STATE_CHANGING_COMMANDS:
+        return
+    try:
+        snapshot = compute_dashboard(con, window_days=30)
+        prev = previous_snapshot(con, window_days=30)
+        save_snapshot(con, snapshot)
+        markdown = render_markdown(snapshot, previous=prev, con=con)
+        out_dir = Path(os.environ.get("NETWORK_CHIEF_DASHBOARDS_DIR", "dashboards"))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "dashboard-30d.md").write_text(markdown, encoding="utf-8")
+        (out_dir / "dashboard-30d.json").write_text(
+            json.dumps(snapshot, indent=2, sort_keys=True), encoding="utf-8"
+        )
+    except Exception as exc:  # pragma: no cover - best-effort hook, never break the parent command
+        print(f"[dashboard] auto-refresh failed: {exc}", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    db_path = db_path_from_env(args.db)
     con = _connection(args.db)
+    rc = _dispatch(args, con)
+    if rc == 0:
+        _maybe_auto_refresh(args, con, db_path)
+    return rc
 
+
+def _dispatch(args, con) -> int:
     if args.command == "init":
         print("Initialized Network Chief database.")
         return 0
@@ -441,13 +512,18 @@ def main(argv: list[str] | None = None) -> int:
         prev = previous_snapshot(con, window_days=args.window)
         if not args.no_snapshot:
             save_snapshot(con, snapshot)
-        markdown = render_markdown(snapshot, previous=prev)
+        markdown = render_markdown(snapshot, previous=prev, con=con, graph_limit=args.graph_limit)
         _write_or_print(markdown, args.out)
         if args.json_out:
             output = Path(args.json_out)
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_text(json.dumps(snapshot, indent=2, sort_keys=True), encoding="utf-8")
             print(f"Wrote {output}")
+        return 0
+
+    if args.command == "graph":
+        markdown = render_graph_markdown(con, limit=args.limit)
+        _write_or_print(markdown, args.out)
         return 0
 
     if args.command == "sync-linkedin":
