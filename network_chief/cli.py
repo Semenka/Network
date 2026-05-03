@@ -14,7 +14,15 @@ from .dashboard import compute_dashboard, previous_snapshot, render_markdown, sa
 from .db import connect, create_goal, db_path_from_env, init_db, list_connection_values, list_goals, record_source_run
 from .graph import render_graph_markdown
 from .drafts import list_drafts, set_draft_status
-from .engagement import prepare_gmail_keepalive, prepare_linkedin_posts, prepare_x_comments, prepare_x_posts
+from .discovery import discover_telegram_handles, import_telegram_csv, set_telegram_handle
+from .engagement import (
+    prepare_gmail_keepalive,
+    prepare_linkedin_posts,
+    prepare_telegram_keepalive,
+    prepare_x_comments,
+    prepare_x_posts,
+    render_telegram_links,
+)
 from .importers.gmail import import_gmail_json, import_gmail_mbox
 from .importers.google_api import (
     auth_google,
@@ -227,6 +235,43 @@ def build_parser() -> argparse.ArgumentParser:
     push.add_argument("--limit", type=int, help="Cap on how many drafts to push.")
     push.add_argument("--status", default="draft", help="Local draft status to filter on (default: draft).")
 
+    disc_tg = sub.add_parser(
+        "discover-telegram",
+        help="Scan all per-person text for Telegram handles (t.me/<h>, tg:<h>); update people.telegram_handle where empty.",
+    )
+
+    set_tg = sub.add_parser(
+        "set-telegram",
+        help="Manually set the telegram_handle for a single person (look up by id, email, linkedin_url, or full_name).",
+    )
+    set_tg.add_argument("--handle", required=True, help="Telegram handle (with or without leading @, or full t.me/<h>).")
+    set_tg_group = set_tg.add_mutually_exclusive_group(required=True)
+    set_tg_group.add_argument("--id")
+    set_tg_group.add_argument("--email")
+    set_tg_group.add_argument("--linkedin-url")
+    set_tg_group.add_argument("--name")
+
+    bulk_tg = sub.add_parser(
+        "import-telegram",
+        help="Bulk import telegram handles from a CSV (columns: <lookup>, handle).",
+    )
+    bulk_tg.add_argument("--file", required=True)
+    bulk_tg.add_argument("--lookup", choices=["email", "linkedin_url", "full_name"], default="email")
+
+    tg_keep = sub.add_parser(
+        "prepare-telegram-keepalive",
+        help="Create Telegram drafts for stale, high-value contacts who have a telegram handle.",
+    )
+    tg_keep.add_argument("--limit", type=int, default=10)
+
+    tg_links = sub.add_parser(
+        "telegram-links",
+        help="Render pending Telegram drafts as clickable t.me deep-links (no bot needed).",
+    )
+    tg_links.add_argument("--limit", type=int, help="Cap on how many drafts to render.")
+    tg_links.add_argument("--out", help="Write the markdown to a file (default stdout).")
+    tg_links.add_argument("--status", default="draft")
+
     drv = sub.add_parser(
         "import-drive",
         help="Download a Google Drive file via the saved Google token and ingest it.",
@@ -267,6 +312,10 @@ _STATE_CHANGING_COMMANDS = frozenset(
         "add-goal",
         "cleanup-people",
         "push-drafts",
+        "discover-telegram",
+        "set-telegram",
+        "import-telegram",
+        "prepare-telegram-keepalive",
     }
 )
 
@@ -563,6 +612,52 @@ def _dispatch(args, con) -> int:
 
     if args.command == "graph":
         markdown = render_graph_markdown(con, limit=args.limit)
+        _write_or_print(markdown, args.out)
+        return 0
+
+    if args.command == "discover-telegram":
+        stats = discover_telegram_handles(con)
+        record_source_run(
+            con,
+            source="telegram_discovery",
+            source_ref=None,
+            status="ok",
+            stats={k: v for k, v in stats.items() if k != "samples"},
+        )
+        print(stats)
+        return 0
+
+    if args.command == "set-telegram":
+        result = set_telegram_handle(
+            con,
+            handle=args.handle,
+            person_id=args.id,
+            email=args.email,
+            linkedin_url=args.linkedin_url,
+            full_name=args.name,
+        )
+        if not result["matched"]:
+            print(f"set-telegram: {result.get('reason', 'no match')}", file=sys.stderr)
+            return 1
+        print(f"set telegram_handle for {result['full_name']} → @{result['handle']}")
+        return 0
+
+    if args.command == "import-telegram":
+        stats = import_telegram_csv(con, args.file, lookup=args.lookup)
+        record_source_run(
+            con, source="telegram_csv_import", source_ref=args.file, status="ok",
+            stats={"matched": stats["matched"], "unmatched": stats["unmatched"]},
+        )
+        print(stats)
+        return 0
+
+    if args.command == "prepare-telegram-keepalive":
+        for draft_id in prepare_telegram_keepalive(con, limit=args.limit):
+            print(draft_id)
+        return 0
+
+    if args.command == "telegram-links":
+        markdown = render_telegram_links(con, status=args.status, limit=args.limit)
         _write_or_print(markdown, args.out)
         return 0
 
