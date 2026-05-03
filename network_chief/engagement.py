@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from typing import Any
+from urllib.parse import quote
 
 from .db import rows_to_dicts
 from .drafts import create_custom_draft, create_draft
@@ -31,6 +32,58 @@ def prepare_gmail_keepalive(con: sqlite3.Connection, *, limit: int = 10) -> list
         if len(draft_ids) >= limit:
             break
     return draft_ids
+
+
+def prepare_telegram_keepalive(con: sqlite3.Connection, *, limit: int = 10) -> list[str]:
+    """Telegram analog of prepare_gmail_keepalive — top stale-high-value contacts who have a telegram_handle."""
+    draft_ids: list[str] = []
+    for person in rank_people(con, limit=limit * 5):
+        if not (person.get("telegram_handle") or "").strip():
+            continue
+        draft_ids.append(create_draft(con, person=person, goal=person.get("goal"), channel="telegram"))
+        if len(draft_ids) >= limit:
+            break
+    return draft_ids
+
+
+def render_telegram_links(con: sqlite3.Connection, *, status: str = "draft", limit: int | None = None) -> str:
+    """Render pending Telegram drafts as clickable t.me deep-links (no Bot API needed)."""
+    sql = """
+        SELECT d.id, p.full_name, p.telegram_handle, d.subject, d.body, d.rationale, d.created_at
+          FROM drafts d JOIN people p ON p.id = d.person_id
+         WHERE d.channel = 'telegram'
+           AND d.status = ?
+           AND p.telegram_handle IS NOT NULL AND p.telegram_handle != ''
+         ORDER BY d.created_at DESC
+    """
+    params: list[Any] = [status]
+    if limit:
+        sql += " LIMIT ?"
+        params.append(limit)
+    rows = con.execute(sql, tuple(params)).fetchall()
+    lines = [
+        f"# Telegram drafts ({len(rows)})",
+        "",
+        "Each link opens Telegram (web or app) with the recipient pre-selected and the message pre-typed. "
+        "Review and click **Send** in Telegram. Then mark the local draft with "
+        "`network-chief approve-draft --id <uuid>` to feed the approval-rate KPI.",
+        "",
+    ]
+    for row in rows:
+        handle = (row["telegram_handle"] or "").lstrip("@")
+        body = row["body"] or ""
+        url = f"https://t.me/{handle}?text={quote(body)}"
+        lines.append(f"## {row['full_name']} — @{handle}")
+        lines.append(f"_draft id: `{row['id']}`_")
+        lines.append("")
+        lines.append(f"> {body.replace(chr(10), chr(10) + '> ')}")
+        lines.append("")
+        lines.append(f"[Open in Telegram →]({url})")
+        lines.append("")
+    if not rows:
+        lines.append("_No pending Telegram drafts. Run `network-chief discover-telegram` then "
+                     "`network-chief prepare-telegram-keepalive`._")
+    return "\n".join(lines)
 
 
 def prepare_linkedin_posts(con: sqlite3.Connection, *, topic: str | None = None, count: int = 3) -> list[str]:

@@ -197,6 +197,33 @@ def init_db(con: sqlite3.Connection) -> None:
             started_at TEXT NOT NULL,
             finished_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS oauth_tokens (
+            id TEXT PRIMARY KEY,
+            provider TEXT NOT NULL,
+            account TEXT NOT NULL,
+            access_token TEXT NOT NULL,
+            refresh_token TEXT,
+            token_type TEXT NOT NULL DEFAULT 'Bearer',
+            scopes TEXT NOT NULL,
+            expires_at TEXT,
+            obtained_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            extra_json TEXT
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_tokens_provider_account
+            ON oauth_tokens(provider, lower(account));
+
+        CREATE TABLE IF NOT EXISTS kpi_snapshots (
+            id TEXT PRIMARY KEY,
+            captured_at TEXT NOT NULL,
+            window_days INTEGER NOT NULL,
+            metrics_json TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_kpi_snapshots_window_time
+            ON kpi_snapshots(window_days, captured_at DESC);
         """
     )
     con.commit()
