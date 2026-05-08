@@ -224,6 +224,16 @@ def init_db(con: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_kpi_snapshots_window_time
             ON kpi_snapshots(window_days, captured_at DESC);
+
+        CREATE TABLE IF NOT EXISTS review_snapshots (
+            id TEXT PRIMARY KEY,
+            captured_at TEXT NOT NULL,
+            window_days INTEGER NOT NULL,
+            findings_json TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_review_snapshots_window_time
+            ON review_snapshots(window_days, captured_at DESC);
         """
     )
     con.commit()

@@ -11,6 +11,7 @@ from .auth.tokens import TokenStore
 from .brief import build_daily_brief, mindmap_json
 from .cleanup import delete_people, find_misclassified
 from .dashboard import compute_dashboard, previous_snapshot, render_markdown, save_snapshot
+from .review import compute_review, previous_review, render_review_markdown, save_review
 from .db import connect, create_goal, db_path_from_env, init_db, list_connection_values, list_goals, record_source_run
 from .graph import render_graph_markdown
 from .drafts import list_drafts, set_draft_status
@@ -209,6 +210,15 @@ def build_parser() -> argparse.ArgumentParser:
     sync_li.add_argument("--watch-dir", default="exports")
     sync_li.add_argument("--timeout", type=int, default=900)
     sync_li.add_argument("--no-browser", action="store_true")
+
+    review = sub.add_parser(
+        "agent-review",
+        help="Weekly retrospective of agent activity + ranked efficiency recommendations (read-only).",
+    )
+    review.add_argument("--window", type=int, default=7)
+    review.add_argument("--out", help="Write markdown to a file.")
+    review.add_argument("--json", dest="json_out", help="Also write the raw JSON review to this path.")
+    review.add_argument("--no-snapshot", action="store_true", help="Render only; do not persist a review_snapshots row.")
 
     dash = sub.add_parser("dashboard", help="Render performance dashboard with deltas vs previous snapshot.")
     dash.add_argument("--window", type=int, default=30, help="Time window in days (default 30).")
@@ -594,6 +604,20 @@ def _dispatch(args, con) -> int:
         except RateLimited as exc:
             print(f"sync-x rate-limited (reset_at={exc.reset_at}): {exc}", file=sys.stderr)
             return 0
+        return 0
+
+    if args.command == "agent-review":
+        rev = compute_review(con, window_days=args.window)
+        prev = previous_review(con, window_days=args.window)
+        if not args.no_snapshot:
+            save_review(con, rev)
+        markdown = render_review_markdown(rev, previous=prev)
+        _write_or_print(markdown, args.out)
+        if args.json_out:
+            output = Path(args.json_out)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(rev, indent=2, sort_keys=True), encoding="utf-8")
+            print(f"Wrote {output}")
         return 0
 
     if args.command == "dashboard":
