@@ -7,10 +7,10 @@ from .db import new_id, now_iso, rows_to_dicts
 
 
 def choose_channel(person: dict[str, Any]) -> str:
-    if person.get("primary_email"):
-        return "gmail"
     if person.get("telegram_handle"):
         return "telegram"
+    if person.get("primary_email"):
+        return "gmail"
     if person.get("whatsapp_phone") or person.get("phone"):
         return "whatsapp"
     if person.get("linkedin_url"):
@@ -18,14 +18,35 @@ def choose_channel(person: dict[str, Any]) -> str:
     return "note"
 
 
-def compose_draft(person: dict[str, Any], goal: dict[str, Any] | None = None) -> dict[str, str]:
+def compose_draft(
+    person: dict[str, Any],
+    goal: dict[str, Any] | None = None,
+    *,
+    channel: str | None = None,
+) -> dict[str, str]:
     name = str(person.get("full_name") or "there").split()[0]
     orgs = person.get("organizations") or "your current work"
     titles = person.get("titles") or ""
     goal_title = goal.get("title") if goal else None
     success_metric = goal.get("success_metric") if goal else None
+    is_telegram = (channel or "").lower() == "telegram"
 
-    if goal_title:
+    if goal_title and is_telegram:
+        subject = f"Catch-up — {goal_title}"
+        body = (
+            f"Hey {name} — quick one. I'm focused on {goal_title}"
+            f"{f' ({success_metric})' if success_metric else ''} this week and was thinking about your "
+            f"{orgs} work. Up for a 15-min call?"
+        )
+        rationale = f"Goal-linked Telegram outreach: {goal_title}"
+    elif is_telegram:
+        subject = "Catch-up"
+        body = (
+            f"Hey {name} — wanted to reconnect. I have {orgs} associated with you in my notes. "
+            "Free for a quick 15-min call sometime soon?"
+        )
+        rationale = "Relationship maintenance — Telegram"
+    elif goal_title:
         subject = f"Quick catch-up around {goal_title}"
         body = (
             f"Hi {name},\n\n"
@@ -62,9 +83,9 @@ def create_draft(
     channel: str | None = None,
     status: str = "draft",
 ) -> str:
-    draft = compose_draft(person, goal)
-    ts = now_iso()
     channel = channel or choose_channel(person)
+    draft = compose_draft(person, goal, channel=channel)
+    ts = now_iso()
     existing = con.execute(
         """
         SELECT id FROM drafts
