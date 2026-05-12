@@ -35,6 +35,7 @@ Purpose:
 - Regularly import all connections.
 - Track roles, companies, connection dates, and LinkedIn interactions.
 - Prepare professional posts to keep the network engaged.
+- Publish only through the official LinkedIn API when a valid posting token/scope exists; otherwise keep publishing manual.
 
 Commands:
 
@@ -46,6 +47,8 @@ network-chief maintain-values
 network-chief prepare-linkedin-posts --topic "AI operator network" --count 3
 network-chief prepare-daily-linkedin-post --industry energy --out data/linkedin-daily-post.md
 network-chief linkedin-rotation --days 7
+network-chief auth-linkedin --posting
+network-chief publish-approved-linkedin --draft-id <id> --confirm-exact-text-file <file>
 ```
 
 Recommended cadence:
@@ -54,6 +57,7 @@ Recommended cadence:
 - Weekly or after campaigns: import LinkedIn messages/interactions.
 - Daily: prepare one rotating energy/AI LinkedIn post with a changing highlight, theme, CTA, and visual.
 - Twice weekly: prepare additional LinkedIn post drafts for non-news audience growth.
+- Safety: no LinkedIn passwords, cookies, scraping, browser-session control, automated likes/comments/DMs, or browser bots.
 
 ## Gmail Module
 
@@ -105,7 +109,7 @@ network-chief prepare-channel-drafts --channels gmail,linkedin,telegram --limit 
 Rules:
 
 - Gmail identities imported from Gmail are send-eligible, but still require draft approval and exact-text confirmation.
-- LinkedIn identities imported from exports are manual-only unless an official connector/API path is added later.
+- LinkedIn identities imported from exports are manual-only unless an official API token with posting scope is configured.
 - Telegram identities are send-eligible only when explicitly stored as handles/chat IDs.
 
 ## Voice Module
@@ -120,6 +124,23 @@ Commands:
 
 ```bash
 network-chief voice-profile rebuild --source sent_mail,approved_edits --out data/voice-profile.md
+```
+
+## GBrain Memory Module
+
+Purpose:
+
+- Pull local gbrain context before ranking/drafting important people or companies.
+- Store cited gbrain snippets as source facts so action rationales are auditable.
+- Write concise event summaries back into gbrain after approved/sent/published/responded outcomes.
+- Avoid raw private message body writeback by default.
+
+Commands:
+
+```bash
+network-chief next-actions --limit 10 --out data/next-actions.md
+network-chief gbrain-context --query "person company topic" --out data/gbrain-context.md
+network-chief sync-gbrain --since-days 7 --mode auto-summary
 ```
 
 ## X.com Module
@@ -165,11 +186,14 @@ Example cron-style routine:
 08:27 network-chief voice-profile rebuild --out data/voice-profile.md
 08:28 network-chief prepare-daily-linkedin-post --industry energy --out data/linkedin-daily-post.md
 08:30 network-chief audience-brief --limit 12 --linkedin-posts 0 --out data/audience-today.md
+08:32 network-chief next-actions --limit 10 --out data/next-actions.md
 08:35 OpenClaw sends Telegram operator summary only
 17:00 network-chief prepare-linkedin-posts --count 2
 17:05 network-chief prepare-x-posts --count 2
 17:10 network-chief prepare-x-comments --count 5
 Sunday 18:00 network-chief scorecard --days 7 --out data/scorecard.md
+Sunday 18:05 network-chief agent-review --window 7 --out dashboards/agent-review-7d.md
+Sunday 18:10 network-chief sync-gbrain --since-days 7 --mode auto-summary
 ```
 
 ## Review Loop

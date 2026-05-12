@@ -120,9 +120,13 @@ def build_scorecard(con: sqlite3.Connection, *, days: int = 7) -> str:
 
     created_total = sum(int(row["count"]) for row in created)
     event_counts = {str(row["event_type"]): int(row["count"]) for row in events}
-    approved = event_counts.get("approve", 0)
+    approved = event_counts.get("approve", 0) + event_counts.get("approved", 0)
     published = event_counts.get("published", 0)
-    responses = event_counts.get("response", 0)
+    responses = (
+        event_counts.get("response", 0)
+        + event_counts.get("responded", 0)
+        + event_counts.get("converted", 0)
+    )
     approval_rate = round((approved / created_total) * 100) if created_total else 0
     response_rate = round((responses / max(1, published)) * 100) if published else 0
 
@@ -182,7 +186,19 @@ def _adaptation_suggestions(
     linkedin_comments = metric_totals.get(("linkedin", "comments"), 0)
     linkedin_reposts = metric_totals.get(("linkedin", "reposts"), 0)
     linkedin_follows = metric_totals.get(("linkedin", "follows"), 0) + metric_totals.get(("linkedin", "profile_views"), 0)
-    responses = event_counts.get("response", 0)
+    responses = (
+        event_counts.get("response", 0)
+        + event_counts.get("responded", 0)
+        + event_counts.get("converted", 0)
+    )
+    useful_conversations = sum(
+        metric_totals.get((channel, "useful_conversations"), 0)
+        for channel in ("linkedin", "gmail", "telegram", "x")
+    )
+    meetings = sum(
+        metric_totals.get((channel, "meetings"), 0)
+        for channel in ("linkedin", "gmail", "telegram", "x")
+    )
 
     if published == 0 and event_counts.get("sent", 0) == 0:
         suggestions.append("- Publish one high-signal post before changing templates; there is no outcome baseline yet.")
@@ -201,6 +217,10 @@ def _adaptation_suggestions(
         suggestions.append("- New profile attention should trigger a light follow-up list: inspect viewers/followers and draft 3 context-aware messages.")
     if responses > 0:
         suggestions.append("- Responses are the strongest signal; raise similar people/topics in the relationship ranking this week.")
+    if useful_conversations > 0:
+        suggestions.append("- Useful conversations beat vanity metrics; preserve the same specificity and move similar contacts earlier in next-actions.")
+    if meetings > 0:
+        suggestions.append("- Meetings booked are conversion signals; turn the path into a reusable follow-up timing experiment.")
     if not suggestions:
         suggestions.append("- Keep the cadence, but test one variable tomorrow: hook, data point, or CTA, not all three.")
     return suggestions

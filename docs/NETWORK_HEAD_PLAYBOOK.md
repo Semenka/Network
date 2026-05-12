@@ -16,6 +16,7 @@ network-chief prepare-daily-linkedin-post --industry energy --out data/linkedin-
 network-chief linkedin-rotation --days 7
 network-chief audience-brief --limit 12 --out data/audience-today.md
 network-chief prepare-channel-drafts --channels gmail,linkedin,telegram --limit 8
+network-chief next-actions --limit 10 --out data/next-actions.md
 network-chief drafts
 network-chief goals
 network-chief mindmap --out data/network-map.json
@@ -27,6 +28,8 @@ Then classify the top 12 into four buckets:
 - **Activate**: people who can help active weekly goals now.
 - **Expand**: LinkedIn/X accounts and second-degree/introduction opportunities.
 - **Compound**: people where helping them increases your long-term reputation.
+
+The `next-actions` queue is the daily operating list. It should include a do/draft/do-nothing recommendation, channel, score, weak-context flag, active-goal fit, and gbrain citations when local memory has useful context.
 
 ## 2) Best interaction surfaces by intent
 
@@ -107,8 +110,9 @@ network-chief approve-draft --id <draft-id> --reason-code good_timing
 network-chief reject-draft --id <draft-id> --reason-code weak_context
 network-chief send-approved-gmail --draft-id <draft-id> --confirm-exact-text-file <file>
 network-chief record-draft-event --id <draft-id> --event published --external-ref linkedin:post-id
-network-chief record-draft-event --id <draft-id> --event response --note "Useful reply"
+network-chief record-engagement-outcome --draft-id <draft-id> --outcome useful_conversation --note "Useful reply"
 network-chief record-audience-metric --channel linkedin --metric-type replies --value 2
+network-chief sync-gbrain --since-days 7 --mode auto-summary
 ```
 
 Minimum reason codes for reject/edit:
@@ -133,6 +137,8 @@ Run:
 
 ```bash
 network-chief scorecard --days 7 --out data/scorecard.md
+network-chief agent-review --window 7 --out dashboards/agent-review-7d.md
+network-chief sync-gbrain --since-days 7 --mode auto-summary
 ```
 
 Target KPIs:
@@ -165,11 +171,15 @@ Recommended cadence on Mac Mini:
 4. Add relationship health bands (green/yellow/red) in brief.
 5. Add "intro path" detection (A -> B -> target) from interaction graph.
 6. Add official connector/API publishing where platform rules allow it.
+7. Add stronger gbrain entity matching for company/project pages.
 
 ## 8) Governance and safety
 
 - Never auto-send externally without explicit approval and exact recipient/text confirmation.
 - Telegram contact outreach requires an explicit stored handle/chat ID.
+- LinkedIn account management is official-API-only. Do not use passwords, cookies, scraping, browser-session control, automated likes/comments/DMs, or browser bots.
+- LinkedIn publishing requires a valid official token/scope and exact-text confirmation; otherwise use the manual checklist.
 - Keep personal data local (`data/`, `exports/`, `.env`).
+- gbrain writeback is summaries-first. Do not write raw private message bodies unless explicitly configured.
 - Tag inferred facts and confidence separately from verified facts.
 - Keep monthly privacy reviews for channel connectors and OAuth scopes.

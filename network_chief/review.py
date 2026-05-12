@@ -60,6 +60,8 @@ EXPECTED_SOURCES_WEEKLY: tuple[str, ...] = (
     "linkedin_oidc",
     "value_maintenance",
     "telegram_discovery",
+    "next_actions",
+    "gbrain_writeback",
 )
 
 
@@ -190,6 +192,32 @@ def compute_review(con: sqlite3.Connection, *, window_days: int = 7) -> dict[str
         ).fetchone()[0]
     )
     x_token_present = _scalar(con, "SELECT count(*) FROM oauth_tokens WHERE provider = 'x'") > 0
+    gbrain_context_people = _scalar(
+        con,
+        """
+        SELECT count(DISTINCT person_id)
+          FROM source_facts
+         WHERE fact_type = 'gbrain_context'
+           AND source = 'gbrain'
+           AND person_id IS NOT NULL
+        """,
+    )
+    linkedin_posts_without_outcomes = _scalar(
+        con,
+        """
+        SELECT count(*)
+          FROM drafts d
+         WHERE d.channel = 'linkedin_post'
+           AND d.status IN ('published', 'sent')
+           AND d.updated_at >= ?
+           AND NOT EXISTS (
+               SELECT 1 FROM draft_events e
+                WHERE e.draft_id = d.id
+                  AND e.event_type IN ('response', 'responded', 'converted', 'outcome', 'no_response')
+           )
+        """,
+        (floor,),
+    )
 
     snapshot_count_in_window = _scalar(
         con, "SELECT count(*) FROM kpi_snapshots WHERE window_days = 30 AND captured_at >= ?", (floor,)
@@ -233,6 +261,8 @@ def compute_review(con: sqlite3.Connection, *, window_days: int = 7) -> dict[str
             "last_run_per_source": last_run_per_source,
             "snapshot_count_in_window": snapshot_count_in_window,
             "days_since_first_kpi": days_since_first_kpi,
+            "gbrain_context_people": gbrain_context_people,
+            "linkedin_posts_without_outcomes": linkedin_posts_without_outcomes,
         },
     }
     review["findings"] = _run_rules(review)
@@ -376,6 +406,36 @@ def _r_low_approval_rate(r: dict[str, Any]) -> Finding | None:
     }
 
 
+def _r_gbrain_coverage(r: dict[str, Any]) -> Finding | None:
+    state = r["state"]
+    if state["total_people"] == 0:
+        return None
+    if state["gbrain_context_people"] >= min(10, state["total_people"]):
+        return None
+    if state["last_run_per_source"].get("next_actions") is None:
+        return None
+    return {
+        "severity": SEV_ATTENTION,
+        "headline": (
+            f"gbrain context covers {state['gbrain_context_people']} people; next-action rationales may miss private memory."
+        ),
+        "evidence": f"gbrain_context_people={state['gbrain_context_people']}, total_people={state['total_people']}",
+        "command": "network-chief next-actions --limit 10 --out data/next-actions.md",
+    }
+
+
+def _r_linkedin_outcome_gap(r: dict[str, Any]) -> Finding | None:
+    missing = r["state"]["linkedin_posts_without_outcomes"]
+    if missing <= 0:
+        return None
+    return {
+        "severity": SEV_ATTENTION,
+        "headline": f"{missing} published LinkedIn post(s) have no recorded outcome.",
+        "evidence": "Published posts need 2h/24h metrics or an explicit no_response outcome.",
+        "command": "network-chief record-engagement-outcome --draft-id <id> --outcome reply|useful_conversation|meeting|no_response",
+    }
+
+
 def _r_cadence_gap(r: dict[str, Any]) -> Finding | None:
     state = r["state"]
     if state["snapshot_count_in_window"] >= 2:
@@ -399,6 +459,8 @@ RULES: list[Callable[[dict[str, Any]], Finding | None]] = [
     _r_subject_diversity,
     _r_stale_backlog,
     _r_low_approval_rate,
+    _r_gbrain_coverage,
+    _r_linkedin_outcome_gap,
     _r_cadence_gap,
 ]
 

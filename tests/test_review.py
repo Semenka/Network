@@ -12,6 +12,7 @@ from network_chief.db import (
     record_source_run,
     upsert_person,
 )
+from network_chief.drafts import apply_draft_event, create_custom_draft
 from network_chief.review import (
     SEV_ATTENTION,
     SEV_CRITICAL,
@@ -147,6 +148,29 @@ class KPIDeltasTest(unittest.TestCase):
         md = render_review_markdown(rev)
         self.assertIn("## KPI deltas (within window)", md)
         self.assertIn("(+20)", md)
+
+
+class MemoryAndOutcomeRulesTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.con = connect(":memory:")
+        init_db(self.con)
+        create_goal(self.con, title="X", cadence="weekly")
+
+    def test_gbrain_coverage_rule_fires_after_next_actions_without_context(self) -> None:
+        upsert_person(self.con, full_name="A", email="a@x.com")
+        record_source_run(self.con, source="next_actions", source_ref=None, status="ok", stats={"actions": 1})
+        rev = compute_review(self.con, window_days=7)
+        findings = [f for f in rev["findings"] if "gbrain context covers" in f["headline"]]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["severity"], SEV_ATTENTION)
+
+    def test_linkedin_published_without_outcome_rule_fires(self) -> None:
+        draft_id = create_custom_draft(self.con, channel="linkedin_post", subject="Post", body="Body")
+        apply_draft_event(self.con, draft_id=draft_id, event_type="published")
+        rev = compute_review(self.con, window_days=7)
+        findings = [f for f in rev["findings"] if "published LinkedIn post" in f["headline"]]
+        self.assertEqual(len(findings), 1)
+        self.assertIn("record-engagement-outcome", findings[0]["command"])
 
 
 class RenderMarkdownTest(unittest.TestCase):

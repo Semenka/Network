@@ -26,7 +26,7 @@ from .db import (
     record_source_run,
 )
 from .discovery import discover_telegram_handles, import_telegram_csv, set_telegram_handle
-from .drafts import apply_draft_event, list_drafts, set_draft_status
+from .drafts import apply_draft_event, list_drafts, record_engagement_outcome, set_draft_status
 from .engagement import (
     prepare_gmail_keepalive,
     prepare_linkedin_posts,
@@ -36,6 +36,7 @@ from .engagement import (
     render_telegram_links,
 )
 from .gmail_sync import summarize_gmail_sync, sync_gmail
+from .gbrain import fetch_gbrain_context, format_gbrain_context, sync_gbrain_summaries
 from .graph import render_graph_markdown
 from .importers.gmail import import_gmail_json, import_gmail_mbox
 from .importers.google_api import (
@@ -60,6 +61,8 @@ from .linkedin_rotation import (
     prepare_rotating_linkedin_post,
     preview_rotation,
 )
+from .linkedin_publish import LinkedInPublishError, publish_approved_linkedin
+from .next_actions import build_next_actions, format_next_actions
 from .outbound import OutboundSafetyError, send_approved_gmail
 from .review import compute_review, previous_review, render_review_markdown, save_review
 from .sync import summarize_sync, sync_sources
@@ -275,9 +278,31 @@ def build_parser() -> argparse.ArgumentParser:
     send_gmail.add_argument("--confirm-exact-text-file", help="File whose contents must exactly equal the stored draft body.")
     send_gmail.add_argument("--dry-run", action="store_true", help="Validate and record send_ready without calling Gmail API.")
 
-    event = sub.add_parser("record-draft-event", help="Record a durable approval, send, publish, response, or review event for a draft.")
+    event = sub.add_parser("record-draft-event", help="Record a durable lifecycle, approval, send, publish, response, or review event for a draft.")
     event.add_argument("--id", required=True, dest="draft_id")
-    event.add_argument("--event", required=True, choices=["approve", "reject", "edit", "sent", "published", "response"])
+    event.add_argument(
+        "--event",
+        required=True,
+        choices=[
+            "proposed",
+            "drafted",
+            "approve",
+            "approved",
+            "reject",
+            "rejected",
+            "edit",
+            "send_ready",
+            "publish_ready",
+            "sent",
+            "published",
+            "response",
+            "responded",
+            "converted",
+            "snoozed",
+            "no_response",
+            "outcome",
+        ],
+    )
     event.add_argument("--reason-code")
     event.add_argument("--note")
     event.add_argument("--external-ref")
@@ -298,6 +323,40 @@ def build_parser() -> argparse.ArgumentParser:
     scorecard = sub.add_parser("scorecard", help="Build the audience-growth scorecard.")
     scorecard.add_argument("--days", type=int, default=7)
     scorecard.add_argument("--out", help="Write scorecard markdown to a file.")
+
+    next_actions = sub.add_parser("next-actions", help="Rank the next best actions across relationships, audience, and memory.")
+    next_actions.add_argument("--limit", type=int, default=10)
+    next_actions.add_argument("--out", default="data/next-actions.md", help="Write next-action queue markdown to a file.")
+    next_actions.add_argument("--no-gbrain", action="store_true", help="Skip gbrain context enrichment for this run.")
+
+    gbrain_context = sub.add_parser("gbrain-context", help="Fetch cited context from the local gbrain knowledge base.")
+    gbrain_context.add_argument("--query", required=True)
+    gbrain_context.add_argument("--limit", type=int, default=5)
+    gbrain_context.add_argument("--out", help="Write context markdown to a file.")
+
+    sync_gbrain = sub.add_parser("sync-gbrain", help="Write approved/sent/published interaction summaries back to gbrain.")
+    sync_gbrain.add_argument("--since-days", type=int, default=7)
+    sync_gbrain.add_argument("--mode", default="auto-summary", choices=["auto-summary"])
+    sync_gbrain.add_argument("--limit", type=int, default=100)
+    sync_gbrain.add_argument("--dry-run", action="store_true")
+
+    li_publish = sub.add_parser("publish-approved-linkedin", help="Publish an approved LinkedIn draft via the official API only.")
+    li_publish.add_argument("--draft-id", required=True)
+    li_publish.add_argument("--confirm-exact-text", help="Must exactly equal the stored draft body.")
+    li_publish.add_argument("--confirm-exact-text-file", help="File whose contents must exactly equal the stored draft body.")
+    li_publish.add_argument("--visibility", default="PUBLIC", choices=["PUBLIC", "CONNECTIONS"])
+    li_publish.add_argument("--dry-run", action="store_true", help="Validate token/scope/body and record publish_ready only.")
+
+    engagement_outcome = sub.add_parser("record-engagement-outcome", help="Record reply/conversation/meeting/no-response outcomes for a draft.")
+    engagement_outcome.add_argument("--draft-id", required=True)
+    engagement_outcome.add_argument(
+        "--outcome",
+        required=True,
+        choices=["useful_conversation", "reply", "meeting", "no_response", "bad_fit"],
+    )
+    engagement_outcome.add_argument("--note")
+    engagement_outcome.add_argument("--external-ref")
+    engagement_outcome.add_argument("--metadata-json")
 
     accounts = sub.add_parser("channel-accounts", help="List or store per-contact Gmail, LinkedIn, and Telegram identities.")
     accounts.add_argument("--channel", choices=["gmail", "linkedin", "telegram"])
@@ -342,6 +401,8 @@ def build_parser() -> argparse.ArgumentParser:
     auth_li = sub.add_parser("auth-linkedin", help="Authorize LinkedIn (OIDC owner identity).")
     auth_li.add_argument("--client-id")
     auth_li.add_argument("--client-secret")
+    auth_li.add_argument("--scopes", help="Override LinkedIn OAuth scopes.")
+    auth_li.add_argument("--posting", action="store_true", help="Request official posting scope w_member_social.")
     auth_li.add_argument("--no-browser", action="store_true")
     auth_li.add_argument("--manual", action="store_true")
     auth_li.add_argument("--redirect-url")
@@ -484,7 +545,11 @@ _STATE_CHANGING_COMMANDS = frozenset(
         "prepare-x-comments",
         "send-approved-gmail",
         "record-draft-event",
+        "record-engagement-outcome",
         "record-audience-metric",
+        "next-actions",
+        "sync-gbrain",
+        "publish-approved-linkedin",
         "approve-draft",
         "reject-draft",
         "add-goal",
@@ -797,6 +862,66 @@ def _dispatch(args, con) -> int:
         _write_or_print(build_scorecard(con, days=args.days), args.out)
         return 0
 
+    if args.command == "next-actions":
+        actions = build_next_actions(con, limit=args.limit, use_gbrain=not args.no_gbrain)
+        _write_or_print(format_next_actions(actions), args.out)
+        return 0
+
+    if args.command == "gbrain-context":
+        results = fetch_gbrain_context(args.query, limit=args.limit)
+        _write_or_print(format_gbrain_context(args.query, results), args.out)
+        return 0
+
+    if args.command == "sync-gbrain":
+        try:
+            stats = sync_gbrain_summaries(
+                con,
+                since_days=args.since_days,
+                mode=args.mode,
+                dry_run=args.dry_run,
+                limit=args.limit,
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(json.dumps(stats, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "publish-approved-linkedin":
+        confirmation = _confirmation_text(args.confirm_exact_text, args.confirm_exact_text_file)
+        try:
+            result = publish_approved_linkedin(
+                con,
+                draft_id=args.draft_id,
+                confirm_exact_text=confirmation,
+                visibility=args.visibility,
+                dry_run=args.dry_run,
+            )
+        except (LinkedInPublishError, AuthRequired, OAuthError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if result["status"] == "published" else 2
+
+    if args.command == "record-engagement-outcome":
+        try:
+            result = record_engagement_outcome(
+                con,
+                draft_id=args.draft_id,
+                outcome=args.outcome,
+                note=args.note,
+                external_ref=args.external_ref,
+                metadata=_metadata(args.metadata_json),
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        if result is None:
+            print(f"Draft not found: {args.draft_id}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+
     if args.command == "channel-accounts":
         if args.send_enabled and args.manual_only:
             print("Use either --send-enabled or --manual-only, not both.", file=sys.stderr)
@@ -892,6 +1017,8 @@ def _dispatch(args, con) -> int:
                 con,
                 client_id=args.client_id,
                 client_secret=args.client_secret,
+                scopes=args.scopes,
+                posting=args.posting,
                 open_browser=not args.no_browser,
                 manual=args.manual,
                 redirect_url=args.redirect_url,
@@ -904,7 +1031,7 @@ def _dispatch(args, con) -> int:
             print(result["authorize_url"])
             print(f"[linkedin] Finish with: network-chief auth-linkedin --redirect-url '<paste here>'")
             return 0
-        print(f"linkedin authorized: {result['account']} ({result.get('name')})")
+        print(f"linkedin authorized: {result['account']} ({result.get('name')}) scopes={result.get('scopes', '')}")
         return 0
 
     if args.command == "auth-status":

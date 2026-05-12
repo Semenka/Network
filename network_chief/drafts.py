@@ -3,15 +3,34 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-from .db import new_id, now_iso, record_draft_event, rows_to_dicts
+from .db import new_id, now_iso, record_audience_metric, record_draft_event, rows_to_dicts
 
 
 DRAFT_EVENT_STATUS: dict[str, str] = {
+    "proposed": "proposed",
+    "drafted": "draft",
     "approve": "approved",
+    "approved": "approved",
     "reject": "rejected",
+    "rejected": "rejected",
+    "edit": "draft",
+    "send_ready": "approved",
+    "publish_ready": "approved",
     "sent": "sent",
     "published": "published",
     "response": "responded",
+    "responded": "responded",
+    "converted": "converted",
+    "snoozed": "snoozed",
+    "no_response": "no_response",
+}
+
+ENGAGEMENT_OUTCOME_EVENTS: dict[str, tuple[str, str, str]] = {
+    "useful_conversation": ("response", "responded", "useful_conversations"),
+    "reply": ("response", "responded", "replies"),
+    "meeting": ("converted", "converted", "meetings"),
+    "no_response": ("no_response", "no_response", "no_responses"),
+    "bad_fit": ("reject", "rejected", "bad_fit"),
 }
 
 
@@ -270,3 +289,59 @@ def apply_draft_event(
         external_ref=external_ref,
         metadata=metadata,
     )
+
+
+def record_engagement_outcome(
+    con: sqlite3.Connection,
+    *,
+    draft_id: str,
+    outcome: str,
+    note: str | None = None,
+    external_ref: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Record a normalized downstream outcome for a draft.
+
+    The outcome is stored both as a draft event and as an audience metric so the
+    weekly scorecard can learn from replies, meetings, and bad-fit signals.
+    """
+
+    if outcome not in ENGAGEMENT_OUTCOME_EVENTS:
+        allowed = ", ".join(sorted(ENGAGEMENT_OUTCOME_EVENTS))
+        raise ValueError(f"Unsupported outcome '{outcome}'. Expected one of: {allowed}")
+    draft = con.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,)).fetchone()
+    if not draft:
+        return None
+
+    event_type, status, metric_type = ENGAGEMENT_OUTCOME_EVENTS[outcome]
+    merged_metadata = {"outcome": outcome, **(metadata or {})}
+    event_id = apply_draft_event(
+        con,
+        draft_id=draft_id,
+        event_type=event_type,
+        reason_code=outcome,
+        note=note,
+        external_ref=external_ref,
+        metadata=merged_metadata,
+    )
+    metric_id = record_audience_metric(
+        con,
+        channel=_metric_channel(str(draft["channel"])),
+        metric_type=metric_type,
+        value=1,
+        draft_id=draft_id,
+        person_id=draft["person_id"],
+        goal_id=draft["goal_id"],
+        note=note,
+        external_ref=external_ref,
+        metadata=merged_metadata,
+    )
+    return {"event_id": event_id, "metric_id": metric_id, "status": status, "outcome": outcome}
+
+
+def _metric_channel(channel: str) -> str:
+    if channel.startswith("linkedin"):
+        return "linkedin"
+    if channel.startswith("x_") or channel == "x":
+        return "x"
+    return channel

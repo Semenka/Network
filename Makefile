@@ -40,7 +40,10 @@ three-channel-smoke:
 	NETWORK_CHIEF_DB=/tmp/network-chief-three-channel-smoke/network.db $(PYTHON) -m network_chief audience-brief --topic "AI operator audience" --limit 3 --out /tmp/network-chief-three-channel-smoke/audience.md
 	NETWORK_CHIEF_DB=/tmp/network-chief-three-channel-smoke/network.db $(PYTHON) -m network_chief prepare-channel-drafts --channels gmail,linkedin,telegram --limit 3 > /tmp/network-chief-three-channel-smoke/channel-drafts.txt
 	NETWORK_CHIEF_DB=/tmp/network-chief-three-channel-smoke/network.db $(PYTHON) -m network_chief record-draft-event --id "$$(NETWORK_CHIEF_DB=/tmp/network-chief-three-channel-smoke/network.db $(PYTHON) -m network_chief drafts | awk 'NR==1 {print $$1}')" --event approve --reason-code good_timing
+	NETWORK_CHIEF_DB=/tmp/network-chief-three-channel-smoke/network.db $(PYTHON) -m network_chief next-actions --no-gbrain --limit 5 --out /tmp/network-chief-three-channel-smoke/next-actions.md
+	NETWORK_CHIEF_DB=/tmp/network-chief-three-channel-smoke/network.db $(PYTHON) -m network_chief record-engagement-outcome --draft-id "$$(NETWORK_CHIEF_DB=/tmp/network-chief-three-channel-smoke/network.db $(PYTHON) -m network_chief drafts --status approved | awk 'NR==1 {print $$1}')" --outcome useful_conversation --note "Smoke outcome"
 	NETWORK_CHIEF_DB=/tmp/network-chief-three-channel-smoke/network.db $(PYTHON) -m network_chief scorecard --days 7 --out /tmp/network-chief-three-channel-smoke/scorecard.md
+	NETWORK_CHIEF_DB=/tmp/network-chief-three-channel-smoke/network.db $(PYTHON) -m network_chief sync-gbrain --since-days 7 --dry-run
 
 preflight: openclaw-preflight
 

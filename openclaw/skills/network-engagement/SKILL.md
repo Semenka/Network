@@ -18,6 +18,7 @@ network-chief prepare-channel-drafts --channels gmail,linkedin,telegram --limit 
 network-chief prepare-linkedin-posts --topic "$NETWORK_TOPIC" --count 3
 network-chief prepare-x-posts --topic "$NETWORK_TOPIC" --count 3
 network-chief prepare-x-comments --topic "$NETWORK_TOPIC" --count 5
+network-chief next-actions --limit 10 --out data/next-actions.md
 network-chief drafts
 network-chief scorecard --days 7 --out data/scorecard.md
 ```
@@ -28,6 +29,7 @@ Report:
 - target channel,
 - intended audience or person,
 - rationale and active goal,
+- gbrain citations when available,
 - risk if context is weak.
 
 Rules:
@@ -38,5 +40,7 @@ Rules:
 - Use LinkedIn posts for professional signal and introduction requests.
 - Use Gmail drafts for high-context relationship maintenance.
 - Use Telegram contact drafts only for explicitly stored Telegram accounts.
-- Record published/sent/response outcomes with `record-draft-event`.
+- Record reply/conversation/meeting outcomes with `record-engagement-outcome`.
 - Record public metrics with `record-audience-metric`.
+- LinkedIn publishing is official-API-only via `publish-approved-linkedin`; otherwise present the manual publish checklist.
+- Never automate LinkedIn with browser sessions, cookies, passwords, scraping, likes, comments, or DMs.

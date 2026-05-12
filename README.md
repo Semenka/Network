@@ -12,7 +12,10 @@ The first version is intentionally conservative:
 - Maintains explicit connection-value signals: financial capital, time saving, competence, and specific knowledge.
 - Builds a mind map of people, organizations, roles, resources, interactions, goals, and drafts.
 - Produces a daily brief of high-leverage interactions and channel-specific engagement drafts.
+- Ranks one Next Best Action queue across relationships, audience work, and gbrain memory.
+- Writes clean interaction summaries back to local gbrain without raw private message bodies.
 - Creates draft messages only. Sending is deliberately left to an approval step.
+- Supports official-API-only LinkedIn publishing when a valid posting token/scope exists.
 - Ships OpenClaw workspace assets so the system can run on a separate Mac Mini later.
 
 No private contact data is committed to this repository.
@@ -42,6 +45,7 @@ network-chief sync-sources --include-downloads --mailbox-owner you@example.com
 network-chief maintain-values
 network-chief voice-profile rebuild --source sent_mail,approved_edits
 network-chief brief --limit 10 --out data/today.md
+network-chief next-actions --limit 10 --out data/next-actions.md
 ```
 
 Default database path:
@@ -69,12 +73,12 @@ The local database stores:
 - `interactions`: emails, messages, meetings, posts, notes.
 - `goals`: weekly, monthly, quarterly network goals.
 - `drafts`: proposed emails/messages/posts awaiting approval.
-- `draft_events`: approve, reject, edit, sent, published, and response events with reason codes.
+- `draft_events`: lifecycle, approve/reject/edit, sent, published, response, conversion, snooze, and outcome events with reason codes.
 - `audience_metrics`: LinkedIn/X metrics and manual audience-growth notes.
 - `channel_accounts`: Gmail, LinkedIn, and Telegram identities with send eligibility and confidence.
 - `voice_examples`: private local samples from sent mail and approved/edited drafts.
 - `voice_profile`: local style summary used to keep drafts concise, warm, specific, and non-transactional.
-- `source_facts`: auditable facts and where they came from.
+- `source_facts`: auditable facts and where they came from, including cited gbrain context/writebacks.
 - `source_runs`: import and maintenance run history.
 
 ## Importing LinkedIn
@@ -177,6 +181,18 @@ network-chief prepare-channel-drafts --channels gmail,linkedin,telegram --limit 
 
 Telegram contact drafts are prepared only for people with explicit stored Telegram handles or chat IDs marked send-enabled. LinkedIn contact drafts remain manual-send drafts unless an official connector/API path is added later.
 
+## Next Actions and GBrain
+
+Generate the daily ranked queue across Gmail, LinkedIn, Telegram, X, public posting, and memory:
+
+```bash
+network-chief next-actions --limit 10 --out data/next-actions.md
+network-chief gbrain-context --query "Alice Energy ADNOC AI operations" --out data/gbrain-context.md
+network-chief sync-gbrain --since-days 7 --mode auto-summary
+```
+
+`next-actions` enriches people with local gbrain citations when available and stores those as `source_facts`. `sync-gbrain` writes concise summaries of approved/sent/published/responded events back into gbrain. It does not write raw private message bodies by default.
+
 ## Importing X.com
 
 Import tracked community accounts, profiles, tweets, or mentions from CSV/JSON/X archive-style files:
@@ -278,7 +294,7 @@ Approve or reject:
 network-chief approve-draft --id <draft-id> --reason-code good_timing
 network-chief reject-draft --id <draft-id> --reason-code weak_context
 network-chief record-draft-event --id <draft-id> --event published --external-ref x:123
-network-chief record-draft-event --id <draft-id> --event response --note "Booked follow-up call"
+network-chief record-engagement-outcome --draft-id <draft-id> --outcome useful_conversation --note "Useful reply"
 ```
 
 Approved means "the stored draft text is acceptable." Gmail still requires a second exact-text confirmation before local sending:
@@ -289,7 +305,18 @@ network-chief send-approved-gmail \
   --confirm-exact-text-file data/exact-approved-body.txt
 ```
 
-Without `GMAIL_ACCESS_TOKEN`, this validates the approval boundary and records `send_ready` only. With `GMAIL_ACCESS_TOKEN`, it creates and sends the Gmail draft through the official Gmail API. LinkedIn publishing and LinkedIn DMs remain manual unless an official connector/API path is configured. Telegram is primarily the operator cockpit; contact sends require an explicit stored Telegram account.
+Without `GMAIL_ACCESS_TOKEN`, this validates the approval boundary and records `send_ready` only. With `GMAIL_ACCESS_TOKEN`, it creates and sends the Gmail draft through the official Gmail API. Telegram is primarily the operator cockpit; contact sends require an explicit stored Telegram account.
+
+LinkedIn can publish only through the official API with valid posting scopes. There is no browser bot, password, cookie, automated like/comment/DM, or session-control path:
+
+```bash
+network-chief auth-linkedin --posting
+network-chief publish-approved-linkedin \
+  --draft-id <draft-id> \
+  --confirm-exact-text-file data/exact-approved-linkedin-post.txt
+```
+
+If the token is missing `w_member_social`/`w_organization_social`, the publish command exits with a manual-publish-required message and records nothing external.
 
 Record public-network metrics and build the weekly scorecard:
 

@@ -38,6 +38,7 @@ DOWNLOAD_DATA_URL = "https://www.linkedin.com/mypreferences/d/download-my-data"
 
 OIDC_SCOPES = "openid profile email"
 DMA_SCOPES = "r_dma_portability_3rd_party"
+POSTING_SCOPES = f"{OIDC_SCOPES} w_member_social"
 
 
 class LinkedInDMARequired(OAuthError):
@@ -68,6 +69,8 @@ def auth_linkedin_owner(
     *,
     client_id: str | None = None,
     client_secret: str | None = None,
+    scopes: str | None = None,
+    posting: bool = False,
     open_browser: bool = True,
     manual: bool = False,
     redirect_url: str | None = None,
@@ -80,7 +83,8 @@ def auth_linkedin_owner(
             "https://www.linkedin.com/developers/apps and add redirect URI "
             f"http://127.0.0.1:{_port()}/callback. Request the 'Sign In with LinkedIn using OpenID Connect' product."
         )
-    flow = _flow(cid, csec, port=_port(), scopes=OIDC_SCOPES)
+    wanted_scopes = scopes or (POSTING_SCOPES if posting else OIDC_SCOPES)
+    flow = _flow(cid, csec, port=_port(), scopes=wanted_scopes)
     if redirect_url:
         token = flow.authorize_finish(redirect_url)
     elif manual:
@@ -121,11 +125,11 @@ def auth_linkedin_owner(
         access_token=token["access_token"],
         refresh_token=token.get("refresh_token"),
         expires_at=token.get("_expires_at"),
-        scopes=token.get("scope") or OIDC_SCOPES,
+        scopes=token.get("scope") or wanted_scopes,
         token_type=token.get("token_type", "Bearer"),
-        extra={"client_id": cid, "sub": sub, "name": name},
+        extra={"client_id": cid, "sub": sub, "name": name, "author_urn": f"urn:li:person:{sub}"},
     )
-    return {"account": email or sub, "name": name, "sub": sub}
+    return {"account": email or sub, "name": name, "sub": sub, "scopes": token.get("scope") or wanted_scopes}
 
 
 def sync_linkedin_dma(con: sqlite3.Connection, *, limit: int | None = None) -> dict[str, Any]:
