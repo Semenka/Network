@@ -6,7 +6,16 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from ..db import add_connection_value, add_interaction, add_resource, add_role, add_source_fact, get_or_create_org, upsert_person
+from ..db import (
+    add_connection_value,
+    add_interaction,
+    add_resource,
+    add_role,
+    add_source_fact,
+    get_or_create_org,
+    upsert_channel_account,
+    upsert_person,
+)
 from ..scoring import infer_connection_values_from_text, infer_resources_from_text
 
 
@@ -63,7 +72,7 @@ def _records(path: str | Path) -> list[dict[str, Any]]:
 
 
 def import_connections(con: sqlite3.Connection, path: str | Path) -> dict[str, int]:
-    people = roles = interactions = resources = values = 0
+    people = accounts = roles = interactions = resources = values = 0
     for row in _linkedin_rows(path):
         first_name = row.get("First Name", "").strip()
         last_name = row.get("Last Name", "").strip()
@@ -84,6 +93,19 @@ def import_connections(con: sqlite3.Connection, path: str | Path) -> dict[str, i
             confidence=0.75,
         )
         people += 1
+        if url:
+            upsert_channel_account(
+                con,
+                person_id=person_id,
+                channel="linkedin",
+                account_ref=url,
+                display_name=full_name,
+                send_enabled=False,
+                source="linkedin_export",
+                confidence=0.8,
+                last_verified_at=connected_on,
+            )
+            accounts += 1
         org_id = get_or_create_org(con, company)
         if org_id or position:
             add_role(
@@ -142,6 +164,7 @@ def import_connections(con: sqlite3.Connection, path: str | Path) -> dict[str, i
             values += 1
     return {
         "people_seen": people,
+        "accounts_seen": accounts,
         "roles_seen": roles,
         "interactions_seen": interactions,
         "resources_seen": resources,
@@ -157,7 +180,7 @@ def import_linkedin_interactions(
     limit: int | None = None,
 ) -> dict[str, int]:
     owner = owner_name.lower() if owner_name else None
-    people = interactions = values = 0
+    people = accounts = interactions = values = 0
     records = _records(path)
     if limit:
         records = records[:limit]
@@ -188,6 +211,19 @@ def import_linkedin_interactions(
             confidence=0.6,
         )
         people += 1
+        if url:
+            upsert_channel_account(
+                con,
+                person_id=person_id,
+                channel="linkedin",
+                account_ref=url,
+                display_name=counterpart,
+                send_enabled=False,
+                source="linkedin_interactions",
+                confidence=0.65,
+                last_verified_at=date,
+            )
+            accounts += 1
         add_interaction(
             con,
             person_id=person_id,
@@ -223,4 +259,4 @@ def import_linkedin_interactions(
             )
             values += 1
 
-    return {"people_seen": people, "interactions_seen": interactions, "values_seen": values}
+    return {"people_seen": people, "accounts_seen": accounts, "interactions_seen": interactions, "values_seen": values}

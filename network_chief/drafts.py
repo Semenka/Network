@@ -3,7 +3,16 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-from .db import new_id, now_iso, rows_to_dicts
+from .db import new_id, now_iso, record_draft_event, rows_to_dicts
+
+
+DRAFT_EVENT_STATUS: dict[str, str] = {
+    "approve": "approved",
+    "reject": "rejected",
+    "sent": "sent",
+    "published": "published",
+    "response": "responded",
+}
 
 
 def choose_channel(person: dict[str, Any]) -> str:
@@ -18,38 +27,46 @@ def choose_channel(person: dict[str, Any]) -> str:
     return "note"
 
 
-def compose_draft(person: dict[str, Any], goal: dict[str, Any] | None = None) -> dict[str, str]:
+def compose_draft(
+    person: dict[str, Any],
+    goal: dict[str, Any] | None = None,
+    *,
+    channel: str | None = None,
+    voice_summary: str | None = None,
+) -> dict[str, str]:
     name = str(person.get("full_name") or "there").split()[0]
     orgs = person.get("organizations") or "your current work"
     titles = person.get("titles") or ""
     goal_title = goal.get("title") if goal else None
     success_metric = goal.get("success_metric") if goal else None
+    channel = channel or choose_channel(person)
+    signoff = "" if channel in {"telegram", "linkedin"} else "\n\nBest,\nAndrey"
+    channel_prefix = "Hey" if channel == "telegram" else "Hi"
 
     if goal_title:
         subject = f"Quick catch-up around {goal_title}"
         body = (
-            f"Hi {name},\n\n"
-            f"I was thinking about your work around {orgs}"
-            f"{f' ({titles})' if titles else ''} and wanted to reconnect.\n\n"
-            f"I am currently focused on: {goal_title}."
-            f"{f' The concrete outcome I am aiming for is {success_metric}.' if success_metric else ''}\n\n"
-            "Would you be open to a short catch-up next week? I would be glad to hear what you are working on "
-            "and see where I can be useful as well.\n\n"
-            "Best,\n"
-            "Andrey"
+            f"{channel_prefix} {name},\n\n"
+            f"I had your work around {orgs}{f' ({titles})' if titles else ''} in mind and wanted to reconnect.\n\n"
+            f"I am focused on {goal_title} right now"
+            f"{f', aiming for {success_metric}' if success_metric else ''}. "
+            "I would value your view, and I am happy to share anything useful from what I am seeing as well.\n\n"
+            "Would a short catch-up next week be easy?"
+            f"{signoff}"
         )
         rationale = f"Goal-linked outreach: {goal_title}"
     else:
         subject = "Quick catch-up"
         body = (
-            f"Hi {name},\n\n"
-            "I wanted to reconnect and hear what you are focused on these days. "
-            f"I have {orgs} associated with your current work in my notes.\n\n"
-            "Would you be open to a short catch-up sometime soon?\n\n"
-            "Best,\n"
-            "Andrey"
+            f"{channel_prefix} {name},\n\n"
+            f"I was going through my network notes and saw {orgs} connected to your current work. "
+            "I wanted to reconnect and hear what you are focused on now.\n\n"
+            "Would a short catch-up sometime soon be easy?"
+            f"{signoff}"
         )
         rationale = "Relationship maintenance draft"
+    if voice_summary:
+        rationale = f"{rationale}; voice: {voice_summary[:180]}"
 
     return {"subject": subject, "body": body, "rationale": rationale}
 
@@ -62,9 +79,15 @@ def create_draft(
     channel: str | None = None,
     status: str = "draft",
 ) -> str:
-    draft = compose_draft(person, goal)
     ts = now_iso()
     channel = channel or choose_channel(person)
+    try:
+        from .voice import get_voice_profile_summary
+
+        voice_summary = get_voice_profile_summary(con)
+    except Exception:
+        voice_summary = None
+    draft = compose_draft(person, goal, channel=channel, voice_summary=voice_summary)
     existing = con.execute(
         """
         SELECT id FROM drafts
@@ -172,10 +195,62 @@ def list_drafts(con: sqlite3.Connection, status: str | None = "draft") -> list[d
     return rows_to_dicts(rows)
 
 
-def set_draft_status(con: sqlite3.Connection, draft_id: str, status: str) -> bool:
+def set_draft_status(
+    con: sqlite3.Connection,
+    draft_id: str,
+    status: str,
+    *,
+    reason_code: str | None = None,
+    note: str | None = None,
+    external_ref: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> bool:
     cur = con.execute(
         "UPDATE drafts SET status = ?, updated_at = ? WHERE id = ?",
         (status, now_iso(), draft_id),
     )
     con.commit()
-    return cur.rowcount > 0
+    if cur.rowcount <= 0:
+        return False
+    event_type = {"approved": "approve", "rejected": "reject"}.get(status)
+    if event_type:
+        record_draft_event(
+            con,
+            draft_id=draft_id,
+            event_type=event_type,
+            reason_code=reason_code,
+            note=note,
+            external_ref=external_ref,
+            metadata=metadata,
+        )
+    return True
+
+
+def apply_draft_event(
+    con: sqlite3.Connection,
+    *,
+    draft_id: str,
+    event_type: str,
+    reason_code: str | None = None,
+    note: str | None = None,
+    external_ref: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> str | None:
+    status = DRAFT_EVENT_STATUS.get(event_type)
+    if status:
+        cur = con.execute(
+            "UPDATE drafts SET status = ?, updated_at = ? WHERE id = ?",
+            (status, now_iso(), draft_id),
+        )
+        con.commit()
+        if cur.rowcount <= 0:
+            return None
+    return record_draft_event(
+        con,
+        draft_id=draft_id,
+        event_type=event_type,
+        reason_code=reason_code,
+        note=note,
+        external_ref=external_ref,
+        metadata=metadata,
+    )

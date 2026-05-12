@@ -9,13 +9,29 @@ from .drafts import choose_channel, create_draft
 from .scoring import rank_people
 
 
-def build_daily_brief(con: sqlite3.Connection, limit: int = 10, create_draft_records: bool = True) -> str:
-    ranked = rank_people(con, limit=limit)
+def _public_channel(person: dict[str, Any]) -> str:
+    if person.get("twitter_handle"):
+        return "x"
+    if person.get("linkedin_url"):
+        return "linkedin"
+    return choose_channel(person)
+
+
+def build_daily_brief(
+    con: sqlite3.Connection,
+    limit: int = 10,
+    create_draft_records: bool = True,
+    *,
+    mode: str = "relationship",
+) -> str:
+    ranked = rank_people(con, limit=limit, mode=mode)
     today = datetime.now(UTC).date().isoformat()
+    title = "Network Chief Audience Brief" if mode == "audience" else "Network Chief Daily Brief"
+    section = "Audience-Growth Targets" if mode == "audience" else "Suggested Interactions"
     lines = [
-        f"# Network Chief Daily Brief - {today}",
+        f"# {title} - {today}",
         "",
-        "## Suggested Interactions",
+        f"## {section}",
         "",
     ]
     if not ranked:
@@ -23,7 +39,7 @@ def build_daily_brief(con: sqlite3.Connection, limit: int = 10, create_draft_rec
             [
                 "No people are available yet.",
                 "",
-                "Import LinkedIn connections, Gmail exports, or add people manually.",
+                "Import LinkedIn connections, Gmail exports, X exports, or add people manually.",
             ]
         )
         return "\n".join(lines)
@@ -31,18 +47,26 @@ def build_daily_brief(con: sqlite3.Connection, limit: int = 10, create_draft_rec
     for index, person in enumerate(ranked, start=1):
         goal = person.get("goal")
         draft_id = create_draft(con, person=person, goal=goal) if create_draft_records else None
+        channel_label = _public_channel(person) if mode == "audience" else choose_channel(person)
         lines.extend(
             [
                 f"### {index}. {person['full_name']}",
                 "",
                 f"- Score: {person['score']}",
-                f"- Channel: {choose_channel(person)}",
+                f"- Channel: {channel_label}",
                 f"- Rationale: {person['rationale']}",
                 f"- Organization: {person.get('organizations') or 'unknown'}",
                 f"- Resources: {person.get('resources') or 'not mapped yet'}",
                 f"- Connection value: {person.get('connection_values') or 'not mapped yet'}",
             ]
         )
+        if mode == "audience":
+            lines.extend(
+                [
+                    f"- Conversation potential: {person.get('conversation_potential', 0)}",
+                    f"- Public recency: {person.get('public_recency_days', 'unknown')} days",
+                ]
+            )
         if goal:
             lines.append(f"- Goal: {goal['title']}")
         if draft_id:
@@ -87,6 +111,19 @@ def export_mindmap(con: sqlite3.Connection) -> dict[str, list[dict[str, Any]]]:
             }
         )
         edges.append({"source": row["person_id"], "target": value_node_id, "type": "has_connection_value"})
+
+    for row in con.execute("SELECT id, person_id, channel, account_ref, send_enabled FROM channel_accounts"):
+        account_node_id = f"channel:{row['id']}"
+        nodes.append(
+            {
+                "id": account_node_id,
+                "label": f"{row['channel']}: {row['account_ref']}",
+                "type": "channel_account",
+                "channel": row["channel"],
+                "send_enabled": bool(row["send_enabled"]),
+            }
+        )
+        edges.append({"source": row["person_id"], "target": account_node_id, "type": "has_channel_account"})
 
     return {"nodes": nodes, "edges": edges}
 
