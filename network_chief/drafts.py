@@ -16,10 +16,10 @@ DRAFT_EVENT_STATUS: dict[str, str] = {
 
 
 def choose_channel(person: dict[str, Any]) -> str:
-    if person.get("primary_email"):
-        return "gmail"
     if person.get("telegram_handle"):
         return "telegram"
+    if person.get("primary_email"):
+        return "gmail"
     if person.get("whatsapp_phone") or person.get("phone"):
         return "whatsapp"
     if person.get("linkedin_url"):
@@ -40,10 +40,26 @@ def compose_draft(
     goal_title = goal.get("title") if goal else None
     success_metric = goal.get("success_metric") if goal else None
     channel = channel or choose_channel(person)
+    is_telegram = channel.lower() == "telegram"
     signoff = "" if channel in {"telegram", "linkedin"} else "\n\nBest,\nAndrey"
     channel_prefix = "Hey" if channel == "telegram" else "Hi"
 
-    if goal_title:
+    if goal_title and is_telegram:
+        subject = f"Catch-up — {goal_title}"
+        body = (
+            f"Hey {name} — quick one. I'm focused on {goal_title}"
+            f"{f' ({success_metric})' if success_metric else ''} this week and was thinking about your "
+            f"{orgs} work. Up for a 15-min call?"
+        )
+        rationale = f"Goal-linked Telegram outreach: {goal_title}"
+    elif is_telegram:
+        subject = "Catch-up"
+        body = (
+            f"Hey {name} — wanted to reconnect. I have {orgs} associated with you in my notes. "
+            "Free for a quick 15-min call sometime soon?"
+        )
+        rationale = "Relationship maintenance — Telegram"
+    elif goal_title:
         subject = f"Quick catch-up around {goal_title}"
         body = (
             f"{channel_prefix} {name},\n\n"
