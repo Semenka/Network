@@ -7,14 +7,18 @@ The first version is intentionally conservative:
 - Stores all personal network memory in a local SQLite database.
 - Imports LinkedIn connections from LinkedIn's official export CSV.
 - Imports LinkedIn interactions, Gmail metadata, and X.com community/profile exports.
+- Tracks Gmail, LinkedIn, and Telegram channel identities per person.
+- Builds a private local voice profile from sent mail and approved edits.
 - Maintains explicit connection-value signals: financial capital, time saving, competence, and specific knowledge.
 - Builds a mind map of people, organizations, roles, resources, interactions, goals, and drafts.
 - Produces a daily brief of high-leverage interactions and channel-specific engagement drafts.
+- Ranks one Next Best Action queue across relationships, audience work, and gbrain memory.
+- Writes clean interaction summaries back to local gbrain without raw private message bodies.
 - Creates draft messages only. Sending is deliberately left to an approval step.
+- Supports official-API-only LinkedIn publishing when a valid posting token/scope exists.
 - Ships OpenClaw workspace assets so the system can run on a separate Mac Mini later.
 
 No private contact data is committed to this repository.
-
 
 For operations guidance focused on daily interaction strategy and feedback loops, see [docs/NETWORK_HEAD_PLAYBOOK.md](docs/NETWORK_HEAD_PLAYBOOK.md).
 For advanced LinkedIn, Gmail, and X.com source modules, see [docs/SOURCE_MODULES.md](docs/SOURCE_MODULES.md).
@@ -22,7 +26,7 @@ For advanced LinkedIn, Gmail, and X.com source modules, see [docs/SOURCE_MODULES
 ## Quick Start
 
 ```bash
-python3 -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -e .
 
@@ -36,8 +40,12 @@ network-chief add-goal \
 network-chief import-linkedin --file exports/Connections.csv
 network-chief import-x --file exports/x_community.json --owner-handle yourhandle
 network-chief import-gmail-mbox --file exports/gmail.mbox --mailbox-owner you@example.com
+network-chief sync-gmail --since-months 24 --max-threads 2000 --mailbox-owner you@example.com
+network-chief sync-sources --include-downloads --mailbox-owner you@example.com
 network-chief maintain-values
+network-chief voice-profile rebuild --source sent_mail,approved_edits
 network-chief brief --limit 10 --out data/today.md
+network-chief next-actions --limit 10 --out data/next-actions.md
 ```
 
 Default database path:
@@ -65,7 +73,12 @@ The local database stores:
 - `interactions`: emails, messages, meetings, posts, notes.
 - `goals`: weekly, monthly, quarterly network goals.
 - `drafts`: proposed emails/messages/posts awaiting approval.
-- `source_facts`: auditable facts and where they came from.
+- `draft_events`: lifecycle, approve/reject/edit, sent, published, response, conversion, snooze, and outcome events with reason codes.
+- `audience_metrics`: LinkedIn/X metrics and manual audience-growth notes.
+- `channel_accounts`: Gmail, LinkedIn, and Telegram identities with send eligibility and confidence.
+- `voice_examples`: private local samples from sent mail and approved/edited drafts.
+- `voice_profile`: local style summary used to keep drafts concise, warm, specific, and non-transactional.
+- `source_facts`: auditable facts and where they came from, including cited gbrain context/writebacks.
 - `source_runs`: import and maintenance run history.
 
 ## Importing LinkedIn
@@ -92,6 +105,14 @@ LinkedIn interaction/message exports can also be imported:
 ```bash
 network-chief import-linkedin-interactions --file exports/linkedin_messages.csv --owner-name "Andrey Semenov"
 network-chief prepare-linkedin-posts --topic "AI operator network" --count 3
+network-chief prepare-daily-linkedin-post --industry energy --out data/linkedin-daily-post.md
+network-chief linkedin-rotation --days 7
+```
+
+To let the agent discover local exports automatically:
+
+```bash
+network-chief sync-sources --scan-dir exports --include-downloads --linkedin-owner-name "Andrey Semenov"
 ```
 
 ## Importing Gmail
@@ -106,6 +127,7 @@ Connector-style JSON is also supported:
 
 ```bash
 network-chief import-gmail-json --file exports/gmail_messages.json --mailbox-owner you@example.com
+network-chief sync-gmail --file data/gmail-connector-sync.json --mailbox-owner you@example.com
 ```
 
 Expected JSON shape:
@@ -127,6 +149,49 @@ Create Gmail keep-alive drafts for stale high-value connections:
 ```bash
 network-chief prepare-gmail-keepalive --limit 10
 ```
+
+For regular source maintenance, place Gmail MBOX or connector JSON files in `exports/` and run:
+
+```bash
+network-chief sync-gmail --since-months 24 --max-threads 2000 --mailbox-owner you@example.com
+network-chief sync-sources --scan-dir exports --mailbox-owner you@example.com
+```
+
+`sync-gmail` is the bounded daily path: it defaults to the last 24 months, caps imports at 2,000 messages/threads per run, and excludes spam, trash, and promotions for connector JSON. By default it looks for `data/gmail-connector-sync.json`, `data/gmail-sync.json`, `exports/`, and optionally `~/Downloads`.
+
+For unattended OpenClaw use, a local Gmail API/OAuth export job should write connector-style JSON into `data/gmail-connector-sync.json`. The Codex Gmail connector can be used interactively, but it is not available inside unattended OpenClaw jobs unless a local export path is configured.
+
+## Channel Accounts and Voice
+
+Store explicit per-contact channel identities:
+
+```bash
+network-chief channel-accounts --channel telegram --person-id <person-id> --handle @alice
+network-chief channel-accounts --channel gmail --person-id <person-id> --email alice@example.com --send-enabled
+network-chief channel-accounts --channel linkedin --person-id <person-id> --linkedin-url https://linkedin.com/in/alice --manual-only
+network-chief channel-accounts --channel telegram
+```
+
+Build the private local voice profile:
+
+```bash
+network-chief voice-profile rebuild --source sent_mail,approved_edits --out data/voice-profile.md
+network-chief prepare-channel-drafts --channels gmail,linkedin,telegram --limit 10
+```
+
+Telegram contact drafts are prepared only for people with explicit stored Telegram handles or chat IDs marked send-enabled. LinkedIn contact drafts remain manual-send drafts unless an official connector/API path is added later.
+
+## Next Actions and GBrain
+
+Generate the daily ranked queue across Gmail, LinkedIn, Telegram, X, public posting, and memory:
+
+```bash
+network-chief next-actions --limit 10 --out data/next-actions.md
+network-chief gbrain-context --query "Alice Energy ADNOC AI operations" --out data/gbrain-context.md
+network-chief sync-gbrain --since-days 7 --mode auto-summary
+```
+
+`next-actions` enriches people with local gbrain citations when available and stores those as `source_facts`. `sync-gbrain` writes concise summaries of approved/sent/published/responded events back into gbrain. It does not write raw private message bodies by default.
 
 ## Importing X.com
 
@@ -173,6 +238,7 @@ Value types:
 
 ```bash
 network-chief brief --limit 10
+network-chief brief --mode audience --limit 10
 ```
 
 The brief ranks people by:
@@ -185,22 +251,88 @@ The brief ranks people by:
 
 It also creates draft outreach records in the local DB.
 
+## Audience Growth Cockpit
+
+Prepare a public-network brief and channel-specific draft set in one pass:
+
+```bash
+network-chief audience-brief \
+  --topic "AI operator audience" \
+  --linkedin-posts 2 \
+  --x-posts 2 \
+  --x-comments 5 \
+  --gmail-followups 3 \
+  --out data/audience-today.md
+```
+
+Audience mode prioritizes active goals, LinkedIn/X context, competence and specific-knowledge signals, recent public interactions, and conversation potential. It still flags weak public context and stale relationships before recommending engagement.
+
+For a daily energy-industry LinkedIn cadence, use the rotating post generator:
+
+```bash
+network-chief prepare-daily-linkedin-post \
+  --industry energy \
+  --topic "AI applications in the energy industry" \
+  --asset-dir data \
+  --out data/linkedin-daily-post.md
+network-chief linkedin-rotation --days 14
+```
+
+The rotation changes the highlight, theme, CTA, and visual style each day. Current slots include company proof points, AI power demand, agentic operations, HPC/industrial data, conference-to-field, low-carbon optimization, and partnership maps. The generated visual stays in `data/` beside the draft report.
+
 ## Draft Approval
 
 List drafts:
 
 ```bash
 network-chief drafts
+network-chief review-queue --limit 12 --out data/review-queue.md
+network-chief source-health --out data/source-health.md
+network-chief outcome-sweep --since-days 7 --out data/outcome-sweep.md
 ```
+
+`review-queue` groups duplicate pending drafts into a short approval list and
+prints the safest post-approval route for each item. `source-health` flags
+missing connector/token/channel/gbrain setup before the agent creates more
+work. `outcome-sweep` finds approved or delivered drafts that still need
+execution, outcome labels, or LinkedIn metric capture.
 
 Approve or reject:
 
 ```bash
-network-chief approve-draft --id <draft-id>
-network-chief reject-draft --id <draft-id>
+network-chief approve-draft --id <draft-id> --reason-code good_timing
+network-chief reject-draft --id <draft-id> --reason-code weak_context
+network-chief record-draft-event --id <draft-id> --event published --external-ref x:123
+network-chief record-engagement-outcome --draft-id <draft-id> --outcome useful_conversation --note "Useful reply"
 ```
 
-Approved means "ready for you or an OpenClaw channel to send." The CLI itself does not send.
+Approved means "the stored draft text is acceptable." Gmail still requires a second exact-text confirmation before local sending:
+
+```bash
+network-chief send-approved-gmail \
+  --draft-id <draft-id> \
+  --confirm-exact-text-file data/exact-approved-body.txt
+```
+
+Without `GMAIL_ACCESS_TOKEN`, this validates the approval boundary and records `send_ready` only. With `GMAIL_ACCESS_TOKEN`, it creates and sends the Gmail draft through the official Gmail API. Telegram is primarily the operator cockpit; contact sends require an explicit stored Telegram account.
+
+LinkedIn can publish only through the official API with valid posting scopes. There is no browser bot, password, cookie, automated like/comment/DM, or session-control path:
+
+```bash
+network-chief auth-linkedin --posting
+network-chief publish-approved-linkedin \
+  --draft-id <draft-id> \
+  --confirm-exact-text-file data/exact-approved-linkedin-post.txt
+```
+
+If the token is missing `w_member_social`/`w_organization_social`, the publish command exits with a manual-publish-required message and records nothing external.
+
+Record public-network metrics and build the weekly scorecard:
+
+```bash
+network-chief record-audience-metric --channel x --metric-type replies --value 3
+network-chief scorecard --days 7 --out data/scorecard.md
+```
 
 ## Mind Map Export
 
@@ -215,7 +347,9 @@ This produces nodes and edges suitable for a graph UI.
 Install OpenClaw on the Mac Mini, clone this repo, then run:
 
 ```bash
+make openclaw-preflight
 bash scripts/install_openclaw_workspace.sh
+bash scripts/setup_openclaw_cron.sh
 ```
 
 See [docs/DEPLOY_OPENCLAW_MAC_MINI.md](docs/DEPLOY_OPENCLAW_MAC_MINI.md).

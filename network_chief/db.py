@@ -177,6 +177,88 @@ def init_db(con: sqlite3.Connection) -> None:
             updated_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS draft_events (
+            id TEXT PRIMARY KEY,
+            draft_id TEXT NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,
+            event_type TEXT NOT NULL,
+            reason_code TEXT,
+            note TEXT,
+            external_ref TEXT,
+            metadata_json TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_draft_events_draft_time
+            ON draft_events(draft_id, created_at);
+
+        CREATE INDEX IF NOT EXISTS idx_draft_events_type_time
+            ON draft_events(event_type, created_at);
+
+        CREATE TABLE IF NOT EXISTS audience_metrics (
+            id TEXT PRIMARY KEY,
+            channel TEXT NOT NULL,
+            metric_type TEXT NOT NULL,
+            value INTEGER NOT NULL DEFAULT 1,
+            metric_date TEXT NOT NULL,
+            draft_id TEXT REFERENCES drafts(id) ON DELETE SET NULL,
+            person_id TEXT REFERENCES people(id) ON DELETE SET NULL,
+            goal_id TEXT REFERENCES goals(id) ON DELETE SET NULL,
+            note TEXT,
+            external_ref TEXT,
+            metadata_json TEXT,
+            observed_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_audience_metrics_channel_date
+            ON audience_metrics(channel, metric_date);
+
+        CREATE INDEX IF NOT EXISTS idx_audience_metrics_type_date
+            ON audience_metrics(metric_type, metric_date);
+
+        CREATE TABLE IF NOT EXISTS channel_accounts (
+            id TEXT PRIMARY KEY,
+            person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+            channel TEXT NOT NULL,
+            account_ref TEXT NOT NULL,
+            display_name TEXT,
+            send_enabled INTEGER NOT NULL DEFAULT 0,
+            source TEXT,
+            confidence REAL NOT NULL DEFAULT 0.5,
+            last_verified_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_accounts_channel_ref
+            ON channel_accounts(channel, lower(account_ref));
+
+        CREATE INDEX IF NOT EXISTS idx_channel_accounts_person_channel
+            ON channel_accounts(person_id, channel);
+
+        CREATE TABLE IF NOT EXISTS voice_examples (
+            id TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            direction TEXT,
+            draft_id TEXT REFERENCES drafts(id) ON DELETE CASCADE,
+            interaction_id TEXT REFERENCES interactions(id) ON DELETE CASCADE,
+            text_sample TEXT NOT NULL,
+            accepted INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_voice_examples_source_channel
+            ON voice_examples(source, channel);
+
+        CREATE TABLE IF NOT EXISTS voice_profile (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            summary TEXT NOT NULL,
+            style_json TEXT,
+            examples_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS source_facts (
             id TEXT PRIMARY KEY,
             person_id TEXT REFERENCES people(id) ON DELETE CASCADE,
@@ -197,6 +279,43 @@ def init_db(con: sqlite3.Connection) -> None:
             started_at TEXT NOT NULL,
             finished_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS oauth_tokens (
+            id TEXT PRIMARY KEY,
+            provider TEXT NOT NULL,
+            account TEXT NOT NULL,
+            access_token TEXT NOT NULL,
+            refresh_token TEXT,
+            token_type TEXT NOT NULL DEFAULT 'Bearer',
+            scopes TEXT NOT NULL,
+            expires_at TEXT,
+            obtained_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            extra_json TEXT
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_tokens_provider_account
+            ON oauth_tokens(provider, lower(account));
+
+        CREATE TABLE IF NOT EXISTS kpi_snapshots (
+            id TEXT PRIMARY KEY,
+            captured_at TEXT NOT NULL,
+            window_days INTEGER NOT NULL,
+            metrics_json TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_kpi_snapshots_window_time
+            ON kpi_snapshots(window_days, captured_at DESC);
+
+        CREATE TABLE IF NOT EXISTS review_snapshots (
+            id TEXT PRIMARY KEY,
+            captured_at TEXT NOT NULL,
+            window_days INTEGER NOT NULL,
+            findings_json TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_review_snapshots_window_time
+            ON review_snapshots(window_days, captured_at DESC);
         """
     )
     con.commit()
@@ -628,6 +747,171 @@ def add_source_fact(
     return fact_id
 
 
+def _normalize_channel_ref(channel: str, account_ref: str) -> str:
+    value = _clean(account_ref) or ""
+    channel = channel.lower().strip()
+    if channel == "gmail":
+        return value.lower()
+    if channel == "telegram":
+        lower = value.lower()
+        if lower.startswith("https://t.me/"):
+            value = "@" + value.rstrip("/").split("/")[-1]
+        return value.lower() if value.startswith("@") else value
+    if channel == "linkedin":
+        return value.rstrip("/")
+    return value
+
+
+def upsert_channel_account(
+    con: sqlite3.Connection,
+    *,
+    person_id: str,
+    channel: str,
+    account_ref: str,
+    display_name: str | None = None,
+    send_enabled: bool = False,
+    source: str | None = None,
+    confidence: float = 0.5,
+    last_verified_at: str | None = None,
+) -> str:
+    channel = (_clean(channel) or "unknown").lower()
+    account_ref = _normalize_channel_ref(channel, account_ref)
+    if not account_ref:
+        raise ValueError("account_ref is required.")
+    ts = now_iso()
+    row = con.execute(
+        """
+        SELECT id FROM channel_accounts
+         WHERE channel = ? AND lower(account_ref) = lower(?)
+        """,
+        (channel, account_ref),
+    ).fetchone()
+    if row:
+        con.execute(
+            """
+            UPDATE channel_accounts
+               SET person_id = ?,
+                   display_name = COALESCE(NULLIF(?, ''), display_name),
+                   send_enabled = CASE WHEN ? THEN 1 ELSE send_enabled END,
+                   source = COALESCE(source, ?),
+                   confidence = MAX(confidence, ?),
+                   last_verified_at = COALESCE(?, last_verified_at),
+                   updated_at = ?
+             WHERE id = ?
+            """,
+            (
+                person_id,
+                _clean(display_name),
+                1 if send_enabled else 0,
+                _clean(source),
+                confidence,
+                last_verified_at,
+                ts,
+                row["id"],
+            ),
+        )
+        _backfill_person_channel(con, person_id=person_id, channel=channel, account_ref=account_ref)
+        con.commit()
+        return str(row["id"])
+
+    account_id = new_id()
+    con.execute(
+        """
+        INSERT INTO channel_accounts (
+            id, person_id, channel, account_ref, display_name, send_enabled,
+            source, confidence, last_verified_at, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            account_id,
+            person_id,
+            channel,
+            account_ref,
+            _clean(display_name),
+            1 if send_enabled else 0,
+            _clean(source),
+            confidence,
+            last_verified_at or ts,
+            ts,
+            ts,
+        ),
+    )
+    _backfill_person_channel(con, person_id=person_id, channel=channel, account_ref=account_ref)
+    con.commit()
+    return account_id
+
+
+def _backfill_person_channel(con: sqlite3.Connection, *, person_id: str, channel: str, account_ref: str) -> None:
+    if channel == "gmail":
+        con.execute(
+            "UPDATE people SET primary_email = COALESCE(primary_email, ?), updated_at = ? WHERE id = ?",
+            (account_ref, now_iso(), person_id),
+        )
+    elif channel == "linkedin":
+        con.execute(
+            "UPDATE people SET linkedin_url = COALESCE(linkedin_url, ?), updated_at = ? WHERE id = ?",
+            (account_ref, now_iso(), person_id),
+        )
+    elif channel == "telegram" and account_ref.startswith("@"):
+        con.execute(
+            "UPDATE people SET telegram_handle = COALESCE(telegram_handle, ?), updated_at = ? WHERE id = ?",
+            (account_ref, now_iso(), person_id),
+        )
+
+
+def list_channel_accounts(
+    con: sqlite3.Connection,
+    *,
+    channel: str | None = None,
+    person_id: str | None = None,
+    send_enabled: bool | None = None,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    params: list[Any] = []
+    filters: list[str] = []
+    if channel:
+        filters.append("channel_accounts.channel = ?")
+        params.append(channel.lower())
+    if person_id:
+        filters.append("channel_accounts.person_id = ?")
+        params.append(person_id)
+    if send_enabled is not None:
+        filters.append("channel_accounts.send_enabled = ?")
+        params.append(1 if send_enabled else 0)
+    where = f"WHERE {' AND '.join(filters)}" if filters else ""
+    query = f"""
+        SELECT
+            channel_accounts.*,
+            people.full_name,
+            people.primary_email,
+            people.linkedin_url,
+            people.telegram_handle
+          FROM channel_accounts
+          JOIN people ON people.id = channel_accounts.person_id
+          {where}
+         ORDER BY channel_accounts.updated_at DESC
+    """
+    if limit:
+        query += " LIMIT ?"
+        params.append(limit)
+    return rows_to_dicts(con.execute(query, params).fetchall())
+
+
+def has_send_enabled_account(con: sqlite3.Connection, *, person_id: str, channel: str) -> bool:
+    row = con.execute(
+        """
+        SELECT 1 FROM channel_accounts
+         WHERE person_id = ?
+           AND channel = ?
+           AND send_enabled = 1
+         LIMIT 1
+        """,
+        (person_id, channel.lower()),
+    ).fetchone()
+    return row is not None
+
+
 def record_source_run(
     con: sqlite3.Connection,
     *,
@@ -684,3 +968,117 @@ def list_goals(con: sqlite3.Connection, status: str | None = "active") -> list[d
     else:
         rows = con.execute("SELECT * FROM goals WHERE status = ? ORDER BY created_at DESC", (status,)).fetchall()
     return rows_to_dicts(rows)
+
+
+def _metadata_json(metadata: dict[str, Any] | None) -> str | None:
+    if not metadata:
+        return None
+    return json.dumps(metadata, sort_keys=True)
+
+
+def record_draft_event(
+    con: sqlite3.Connection,
+    *,
+    draft_id: str,
+    event_type: str,
+    reason_code: str | None = None,
+    note: str | None = None,
+    external_ref: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> str | None:
+    if not con.execute("SELECT id FROM drafts WHERE id = ?", (draft_id,)).fetchone():
+        return None
+    event_id = new_id()
+    con.execute(
+        """
+        INSERT INTO draft_events (
+            id, draft_id, event_type, reason_code, note, external_ref,
+            metadata_json, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            event_id,
+            draft_id,
+            _clean(event_type) or "event",
+            _clean(reason_code),
+            _clean(note),
+            _clean(external_ref),
+            _metadata_json(metadata),
+            now_iso(),
+        ),
+    )
+    con.commit()
+    return event_id
+
+
+def list_draft_events(
+    con: sqlite3.Connection,
+    *,
+    draft_id: str | None = None,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    params: list[Any] = []
+    where = ""
+    if draft_id:
+        where = "WHERE draft_events.draft_id = ?"
+        params.append(draft_id)
+    query = f"""
+        SELECT
+            draft_events.*,
+            drafts.channel,
+            drafts.subject,
+            people.full_name
+          FROM draft_events
+          JOIN drafts ON drafts.id = draft_events.draft_id
+          LEFT JOIN people ON people.id = drafts.person_id
+          {where}
+         ORDER BY draft_events.created_at DESC
+    """
+    if limit:
+        query += " LIMIT ?"
+        params.append(limit)
+    return rows_to_dicts(con.execute(query, params).fetchall())
+
+
+def record_audience_metric(
+    con: sqlite3.Connection,
+    *,
+    channel: str,
+    metric_type: str,
+    value: int = 1,
+    metric_date: str | None = None,
+    draft_id: str | None = None,
+    person_id: str | None = None,
+    goal_id: str | None = None,
+    note: str | None = None,
+    external_ref: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> str:
+    metric_id = new_id()
+    ts = now_iso()
+    con.execute(
+        """
+        INSERT INTO audience_metrics (
+            id, channel, metric_type, value, metric_date, draft_id, person_id,
+            goal_id, note, external_ref, metadata_json, observed_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            metric_id,
+            _clean(channel) or "unknown",
+            _clean(metric_type) or "note",
+            int(value),
+            metric_date or ts[:10],
+            _clean(draft_id),
+            _clean(person_id),
+            _clean(goal_id),
+            _clean(note),
+            _clean(external_ref),
+            _metadata_json(metadata),
+            ts,
+        ),
+    )
+    con.commit()
+    return metric_id

@@ -16,7 +16,9 @@ $ROOT
 
 Run from the repository root:
 
+network-chief next-actions --limit 10 --out data/next-actions.md
 network-chief brief --limit 10 --out data/today.md
+network-chief audience-brief --limit 12 --out data/audience-today.md
 EOF
 
 echo "Installed OpenClaw workspace assets to $DEST"

@@ -12,7 +12,7 @@ cd Network
 ## 2. Python Environment
 
 ```bash
-python3 -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -e .
 network-chief init
@@ -46,6 +46,14 @@ Gmail Takeout:
 network-chief import-gmail-mbox --file exports/gmail.mbox --mailbox-owner "$MAILBOX_OWNER"
 ```
 
+Daily bounded Gmail sync from connector JSON or local Gmail API/OAuth export:
+
+```bash
+network-chief sync-gmail --since-months 24 --max-threads 2000 --mailbox-owner "$MAILBOX_OWNER" --out data/gmail-sync.md
+```
+
+For unattended runs, write connector-style Gmail JSON to `data/gmail-connector-sync.json`.
+
 ## 5. Install OpenClaw
 
 ```bash
@@ -63,16 +71,30 @@ bash scripts/install_openclaw_workspace.sh
 ## 7. Daily Routine
 
 ```bash
-network-chief brief --limit 10 --out data/today.md
+network-chief sync-gmail --since-months 24 --max-threads 2000 --out data/gmail-sync.md
+network-chief sync-sources --scan-dir exports --include-downloads --out data/source-sync.md
+network-chief voice-profile rebuild --source sent_mail,approved_edits --out data/voice-profile.md
+network-chief prepare-daily-linkedin-post --industry energy --out data/linkedin-daily-post.md
+network-chief audience-brief --limit 10 --out data/audience-today.md
+network-chief prepare-channel-drafts --channels gmail,linkedin,telegram --limit 8
 network-chief drafts
+network-chief scorecard --days 7 --out data/scorecard.md
 ```
 
 Recommended OpenClaw cron behavior:
 
-1. Run the brief every morning.
-2. Summarize the suggested interactions.
-3. Ask which drafts should be approved.
-4. Send nothing until the user approves exact text and recipient.
+1. Sync Gmail, LinkedIn, X, and value signals every morning.
+2. Rebuild the local voice profile from private approved/sent examples.
+3. Prepare one rotating daily LinkedIn post with a changed highlight/theme/visual.
+4. Summarize suggested public-network interactions and draft IDs in Telegram.
+5. Ask which drafts should be approved/rejected/edited.
+6. Send nothing until the user approves exact text and recipient; Gmail requires a second `send-approved-gmail` confirmation.
+
+Install the explicit Telegram cron jobs:
+
+```bash
+bash scripts/setup_openclaw_cron.sh
+```
 
 ## 8. Security Notes
 
@@ -80,4 +102,4 @@ Recommended OpenClaw cron behavior:
 - Use official LinkedIn exports rather than scraping.
 - Use Gmail Takeout or OAuth/API access.
 - Keep channel integrations allowlisted.
-- Keep outbound actions approval-gated.
+- Keep outbound actions approval-gated and exact-text confirmed.
