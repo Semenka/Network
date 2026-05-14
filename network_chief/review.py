@@ -281,16 +281,19 @@ def _r_idle_drafts(r: dict[str, Any]) -> Finding | None:
     p = r["pipeline"]
     if p["drafts_created"] == 0:
         return None
-    if p["drafts_approved"] + p["drafts_rejected"] > 0:
+    if p["pending_drafts"] == 0:
         return None
     idle = p["mean_idle_h"]
     if idle is None or idle <= 24:
         return None
+    decided = p["drafts_approved"] + p["drafts_rejected"]
+    if decided >= p["pending_drafts"]:
+        return None
     return {
         "severity": SEV_CRITICAL,
         "headline": f"{p['pending_drafts']} drafts queued; no decisions in {idle:.0f}h. Approval-rate KPI is starving.",
-        "evidence": f"pending={p['pending_drafts']}, mean_idle_h={idle}, max_idle_h={p['max_idle_h']}",
-        "command": "network-chief drafts; then approve-draft --id <…> / reject-draft --id <…>",
+        "evidence": f"pending={p['pending_drafts']}, decided={decided}, mean_idle_h={idle}, max_idle_h={p['max_idle_h']}",
+        "command": "network-chief review-queue --limit 12 --out data/review-queue.md   # then approve-draft/reject-draft grouped items",
     }
 
 

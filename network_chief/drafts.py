@@ -130,11 +130,14 @@ def create_draft(
            AND COALESCE(goal_id, '') = COALESCE(?, '')
            AND channel = ?
            AND status = 'draft'
-           AND substr(created_at, 1, 10) = ?
+         ORDER BY updated_at DESC, created_at DESC
+         LIMIT 1
         """,
-        (person.get("id"), goal.get("id") if goal else None, channel, ts[:10]),
+        (person.get("id"), goal.get("id") if goal else None, channel),
     ).fetchone()
     if existing:
+        con.execute("UPDATE drafts SET updated_at = ? WHERE id = ?", (ts, existing["id"]))
+        con.commit()
         return str(existing["id"])
 
     draft_id = new_id()
@@ -184,11 +187,14 @@ def create_custom_draft(
            AND COALESCE(subject, '') = COALESCE(?, '')
            AND body = ?
            AND status = 'draft'
-           AND substr(created_at, 1, 10) = ?
+         ORDER BY updated_at DESC, created_at DESC
+         LIMIT 1
         """,
-        (person_id, goal_id, channel, subject or "", body, ts[:10]),
+        (person_id, goal_id, channel, subject or "", body),
     ).fetchone()
     if existing:
+        con.execute("UPDATE drafts SET updated_at = ? WHERE id = ?", (ts, existing["id"]))
+        con.commit()
         return str(existing["id"])
 
     draft_id = new_id()

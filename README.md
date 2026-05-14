@@ -286,7 +286,16 @@ List drafts:
 
 ```bash
 network-chief drafts
+network-chief review-queue --limit 12 --out data/review-queue.md
+network-chief source-health --out data/source-health.md
+network-chief outcome-sweep --since-days 7 --out data/outcome-sweep.md
 ```
+
+`review-queue` groups duplicate pending drafts into a short approval list and
+prints the safest post-approval route for each item. `source-health` flags
+missing connector/token/channel/gbrain setup before the agent creates more
+work. `outcome-sweep` finds approved or delivered drafts that still need
+execution, outcome labels, or LinkedIn metric capture.
 
 Approve or reject:
 

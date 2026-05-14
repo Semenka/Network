@@ -35,6 +35,15 @@ from .engagement import (
     prepare_x_posts,
     render_telegram_links,
 )
+from .efficiency import (
+    build_outcome_sweep,
+    build_review_queue,
+    build_source_health,
+    render_outcome_sweep_markdown,
+    render_review_queue_markdown,
+    render_source_health_markdown,
+    safe_execution_route,
+)
 from .gmail_sync import summarize_gmail_sync, sync_gmail
 from .gbrain import fetch_gbrain_context, format_gbrain_context, sync_gbrain_summaries
 from .graph import render_graph_markdown
@@ -219,6 +228,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     drafts = sub.add_parser("drafts", help="List drafts.")
     drafts.add_argument("--status", default="draft", help="Draft status or 'all'.")
+
+    review_queue = sub.add_parser("review-queue", help="Render a grouped, approval-focused queue for pending drafts.")
+    review_queue.add_argument("--limit", type=int, default=12)
+    review_queue.add_argument("--out", default="data/review-queue.md", help="Write review queue markdown to a file.")
+
+    source_health = sub.add_parser("source-health", help="Report missing source connectors, tokens, channel coverage, and gbrain readiness.")
+    source_health.add_argument("--top", type=int, default=50, help="How many top-ranked people to inspect for reachability.")
+    source_health.add_argument("--out", default="data/source-health.md", help="Write source health markdown to a file.")
+
+    outcome_sweep = sub.add_parser("outcome-sweep", help="Find approved/delivered drafts that need execution, outcomes, or LinkedIn metrics.")
+    outcome_sweep.add_argument("--since-days", type=int, default=7)
+    outcome_sweep.add_argument("--out", default="data/outcome-sweep.md", help="Write outcome sweep markdown to a file.")
 
     values = sub.add_parser("connection-values", help="List inferred possible value for connections.")
     values.add_argument("--type", help="Filter by value type.")
@@ -711,6 +732,21 @@ def _dispatch(args, con) -> int:
             print(f"{draft['id']} | {draft['status']} | {draft['channel']} | {draft.get('full_name') or 'unknown'} | {draft.get('subject') or ''}")
         return 0
 
+    if args.command == "review-queue":
+        queue = build_review_queue(con, limit=args.limit)
+        _write_or_print(render_review_queue_markdown(queue), args.out)
+        return 0
+
+    if args.command == "source-health":
+        health = build_source_health(con, top_n=args.top)
+        _write_or_print(render_source_health_markdown(health), args.out)
+        return 0
+
+    if args.command == "outcome-sweep":
+        sweep = build_outcome_sweep(con, since_days=args.since_days)
+        _write_or_print(render_outcome_sweep_markdown(sweep), args.out)
+        return 0
+
     if args.command == "connection-values":
         for value in list_connection_values(con, value_type=args.type, limit=args.limit):
             handle = f"@{value['twitter_handle']}" if value.get("twitter_handle") else value.get("primary_email") or ""
@@ -793,6 +829,17 @@ def _dispatch(args, con) -> int:
             print(f"Draft not found: {args.id}", file=sys.stderr)
             return 1
         print(f"Approved draft {args.id}")
+        row = con.execute(
+            """
+            SELECT d.*, p.full_name, p.primary_email, p.telegram_handle
+              FROM drafts d
+              LEFT JOIN people p ON p.id = d.person_id
+             WHERE d.id = ?
+            """,
+            (args.id,),
+        ).fetchone()
+        if row:
+            print(f"Next safe route: {safe_execution_route(con, dict(row))}")
         return 0
 
     if args.command == "reject-draft":

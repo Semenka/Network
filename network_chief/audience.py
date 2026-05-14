@@ -113,6 +113,23 @@ def build_scorecard(con: sqlite3.Connection, *, days: int = 7) -> str:
         """,
         (cutoff,),
     )
+    subject_rows = _count_rows(
+        con,
+        """
+        SELECT channel, COALESCE(subject, '') AS subject, count(*) AS count
+          FROM drafts
+         WHERE created_at >= ?
+         GROUP BY channel, COALESCE(subject, '')
+         ORDER BY count DESC, channel, subject
+         LIMIT 10
+        """,
+        (cutoff,),
+    )
+    subject_stats = con.execute(
+        "SELECT count(DISTINCT COALESCE(subject, '')) FROM drafts WHERE created_at >= ?",
+        (cutoff,),
+    ).fetchone()
+    distinct_subjects = int((subject_stats[0] if subject_stats else 0) or 0)
     metric_totals = {
         (str(row["channel"]), str(row["metric_type"])): int(row["value"] or 0)
         for row in metrics
@@ -122,6 +139,7 @@ def build_scorecard(con: sqlite3.Connection, *, days: int = 7) -> str:
     event_counts = {str(row["event_type"]): int(row["count"]) for row in events}
     approved = event_counts.get("approve", 0) + event_counts.get("approved", 0)
     published = event_counts.get("published", 0)
+    sent = event_counts.get("sent", 0)
     responses = (
         event_counts.get("response", 0)
         + event_counts.get("responded", 0)
@@ -140,7 +158,7 @@ def build_scorecard(con: sqlite3.Connection, *, days: int = 7) -> str:
         "",
         f"- Drafts created: {created_total}",
         f"- Draft approvals: {approved} ({approval_rate}% of created drafts)",
-        f"- Published/sent items: {published + event_counts.get('sent', 0)}",
+        f"- Published/sent items: {published + sent}",
         f"- Responses recorded: {responses} ({response_rate}% of published items)",
         "",
         "## Drafts Created by Channel",
@@ -155,6 +173,10 @@ def build_scorecard(con: sqlite3.Connection, *, days: int = 7) -> str:
             lines.append(f"- {row['channel']} / {row['event_type']}: {row['count']}")
     else:
         lines.append("- none")
+    lines.extend(["", "## Channel Conversion", ""])
+    lines.extend(_format_channel_conversion(created=created, channel_events=channel_events, metrics=metrics))
+    lines.extend(["", "## Template Signals", ""])
+    lines.extend(_format_template_signals(created_total=created_total, distinct_subjects=distinct_subjects, subject_rows=subject_rows))
     lines.extend(["", "## Audience Metrics", ""])
     if metrics:
         for row in metrics:
@@ -164,7 +186,16 @@ def build_scorecard(con: sqlite3.Connection, *, days: int = 7) -> str:
     lines.extend(["", "## Review Signals", ""])
     lines.extend(_format_count_rows(reasons, "reason_code"))
     lines.extend(["", "## Adaptation Suggestions", ""])
-    lines.extend(_adaptation_suggestions(metric_totals=metric_totals, event_counts=event_counts, published=published))
+    lines.extend(
+        _adaptation_suggestions(
+            metric_totals=metric_totals,
+            event_counts=event_counts,
+            published=published,
+            created_total=created_total,
+            distinct_subjects=distinct_subjects,
+            subject_rows=subject_rows,
+        )
+    )
     return "\n".join(lines)
 
 
@@ -174,11 +205,78 @@ def _format_count_rows(rows: list[dict[str, Any]], label: str) -> list[str]:
     return [f"- {row[label]}: {row['count']}" for row in rows]
 
 
+def _format_channel_conversion(
+    *,
+    created: list[dict[str, Any]],
+    channel_events: list[dict[str, Any]],
+    metrics: list[dict[str, Any]],
+) -> list[str]:
+    channels = {str(row["channel"]) for row in created}
+    channels.update(str(row["channel"]) for row in channel_events)
+    channels.update(str(row["channel"]) for row in metrics)
+    if not channels:
+        return ["- none"]
+    created_by_channel = {str(row["channel"]): int(row["count"]) for row in created}
+    event_by_channel: dict[tuple[str, str], int] = {}
+    for row in channel_events:
+        event_by_channel[(str(row["channel"]), str(row["event_type"]))] = int(row["count"])
+    metric_by_channel: dict[tuple[str, str], int] = {}
+    for row in metrics:
+        metric_by_channel[(str(row["channel"]), str(row["metric_type"]))] = int(row["value"] or 0)
+
+    lines: list[str] = []
+    for channel in sorted(channels):
+        channel_created = created_by_channel.get(channel, 0)
+        approved = event_by_channel.get((channel, "approve"), 0) + event_by_channel.get((channel, "approved"), 0)
+        delivered = event_by_channel.get((channel, "sent"), 0) + event_by_channel.get((channel, "published"), 0)
+        responses = (
+            event_by_channel.get((channel, "response"), 0)
+            + event_by_channel.get((channel, "responded"), 0)
+            + event_by_channel.get((channel, "converted"), 0)
+        )
+        meetings = metric_by_channel.get((channel, "meetings"), 0)
+        lines.append(
+            "- "
+            f"{channel}: created {channel_created}, approved {approved} ({_rate(approved, channel_created)}%), "
+            f"delivered {delivered} ({_rate(delivered, approved)}% of approved), "
+            f"responses {responses} ({_rate(responses, delivered)}% of delivered), meetings {meetings}"
+        )
+    return lines
+
+
+def _format_template_signals(
+    *,
+    created_total: int,
+    distinct_subjects: int,
+    subject_rows: list[dict[str, Any]],
+) -> list[str]:
+    if created_total == 0:
+        return ["- none"]
+    diversity = round(distinct_subjects / created_total, 3)
+    lines = [f"- Subject diversity: {distinct_subjects}/{created_total} = {diversity}"]
+    repeated = [row for row in subject_rows if int(row["count"]) > 1]
+    if repeated:
+        lines.append("- Top repeated subjects:")
+        for row in repeated[:5]:
+            subject = row["subject"] or "(none)"
+            lines.append(f"  - {row['channel']} / {subject}: {row['count']}")
+    else:
+        lines.append("- No repeated subjects in the window.")
+    return lines
+
+
+def _rate(part: int, total: int) -> int:
+    return round((part / total) * 100) if total else 0
+
+
 def _adaptation_suggestions(
     *,
     metric_totals: dict[tuple[str, str], int],
     event_counts: dict[str, int],
     published: int,
+    created_total: int,
+    distinct_subjects: int,
+    subject_rows: list[dict[str, Any]],
 ) -> list[str]:
     suggestions: list[str] = []
     linkedin_impressions = metric_totals.get(("linkedin", "impressions"), 0)
@@ -204,6 +302,10 @@ def _adaptation_suggestions(
         suggestions.append("- Publish one high-signal post before changing templates; there is no outcome baseline yet.")
     if not metric_totals:
         suggestions.append("- After posting, record 2-hour and 24-hour LinkedIn metrics so tomorrow's post can adapt.")
+    subject_diversity = (distinct_subjects / created_total) if created_total else 1.0
+    if created_total > 5 and subject_diversity < 0.3:
+        suggestions.append("- Draft templates are repeating; use the review queue to approve/reject one grouped item instead of creating more same-subject drafts.")
+    if not metric_totals:
         return suggestions
     if linkedin_impressions and linkedin_reactions == 0 and linkedin_comments == 0:
         suggestions.append("- The topic reached people but did not invite action; make tomorrow's opening more opinionated and the question narrower.")
