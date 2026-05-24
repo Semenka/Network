@@ -24,6 +24,13 @@ List goals:
 network-chief goals
 ```
 
+Make the success metric measurable with milestones (rendered as progress bars in the dashboard, e.g. `warm investor conversations: 2/5 (40%)`):
+
+```bash
+network-chief add-milestone --goal-id <goal-id> --metric "warm investor conversations" --target 5 --current 0
+network-chief update-milestone --id <milestone-id> --current 2
+```
+
 Goal quality checklist:
 
 - clear target segment,

@@ -221,12 +221,19 @@ def compute_dashboard(con: sqlite3.Connection, *, window_days: int = 30) -> dict
                 sql += " AND lower(cv.value_type) LIKE ?"
                 params.append(f"%{capital}%")
             count = _scalar(con, sql, tuple(params))
+        milestones = rows_to_dicts(
+            con.execute(
+                "SELECT metric_name, target_value, current_value FROM goal_milestones WHERE goal_id = ? ORDER BY metric_name",
+                (goal["id"],),
+            ).fetchall()
+        )
         goal_coverage.append(
             {
                 "id": goal["id"],
                 "title": goal["title"],
                 "cadence": goal["cadence"],
                 "matching_people": count,
+                "milestones": milestones,
             }
         )
 
@@ -431,6 +438,11 @@ def render_markdown(
             out.append(
                 f"- _{goal['title']}_ ({goal['cadence']}): {goal['matching_people']} matching contacts"
             )
+            for m in goal.get("milestones") or []:
+                target = m["target_value"] or 0
+                current = m["current_value"] or 0
+                pct = round(100 * current / target, 0) if target else 0
+                out.append(f"  - {m['metric_name']}: {current:g}/{target:g} ({pct:g}%)")
     out.append("")
 
     if con is not None:

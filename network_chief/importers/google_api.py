@@ -30,6 +30,8 @@ from ..db import (
     add_role,
     add_source_fact,
     get_or_create_org,
+    mark_draft_pushed,
+    mark_draft_responded,
     upsert_person,
 )
 from ..scoring import infer_connection_values_from_text
@@ -330,7 +332,7 @@ def sync_gmail_messages(
             params["pageToken"] = meta["page_token"]
         return request_json("GET", GMAIL_LIST_URL, headers=headers, params=params)
 
-    seen_messages = seen_people = seen_interactions = 0
+    seen_messages = seen_people = seen_interactions = replies = 0
     for page in paginate(list_fetcher, next_token_keys=("nextPageToken",)):
         for entry in page.get("messages") or []:
             if limit and seen_messages >= limit:
@@ -338,6 +340,7 @@ def sync_gmail_messages(
                     "messages_seen": seen_messages,
                     "people_seen": seen_people,
                     "interactions_seen": seen_interactions,
+                    "replies_detected": replies,
                     "status": "ok",
                 }
             message = request_json(
@@ -349,16 +352,81 @@ def sync_gmail_messages(
                     "metadataHeaders": ["From", "To", "Cc", "Subject", "Date"],
                 },
             )
-            people, interactions = _ingest_gmail_message(con, message, owner=owner)
+            people, interactions, msg_replies = _ingest_gmail_message(con, message, owner=owner)
             seen_messages += 1
             seen_people += people
             seen_interactions += interactions
+            replies += msg_replies
     return {
         "messages_seen": seen_messages,
         "people_seen": seen_people,
         "interactions_seen": seen_interactions,
+        "replies_detected": replies,
         "status": "ok",
     }
+
+
+def _detect_reply(
+    con: sqlite3.Connection,
+    *,
+    thread_id: str | None,
+    occurred_at: str | None,
+) -> int:
+    """Flag any pending draft on this Gmail thread as responded.
+
+    Match is thread-based: an incoming message on a thread we pushed a
+    draft into, arriving after we pushed, is treated as a reply.
+    """
+    if not thread_id:
+        return 0
+    rows = con.execute(
+        "SELECT id, sent_at FROM drafts WHERE gmail_thread_id = ? AND outcome != 'responded'",
+        (thread_id,),
+    ).fetchall()
+    detected = 0
+    for row in rows:
+        sent_at = row["sent_at"]
+        if sent_at and occurred_at and occurred_at <= sent_at:
+            continue
+        if mark_draft_responded(con, row["id"], responded_at=occurred_at):
+            detected += 1
+    return detected
+
+
+def detect_replies_heuristic(con: sqlite3.Connection) -> dict[str, int]:
+    """Fallback for drafts sent outside this tool (no stored thread id).
+
+    Marks a pending draft as responded if the recipient has any incoming
+    gmail interaction recorded after the draft's sent_at (or created_at).
+    Less precise than thread matching — opt-in via ``sync-google --heuristic``.
+    """
+    rows = con.execute(
+        """
+        SELECT d.id, COALESCE(d.sent_at, d.created_at) AS since, p.primary_email
+          FROM drafts d JOIN people p ON p.id = d.person_id
+         WHERE d.outcome != 'responded'
+           AND (d.gmail_thread_id IS NULL OR d.gmail_thread_id = '')
+           AND p.primary_email IS NOT NULL AND p.primary_email != ''
+        """
+    ).fetchall()
+    detected = 0
+    for row in rows:
+        hit = con.execute(
+            """
+            SELECT 1
+              FROM interactions i
+              JOIN people p ON p.id = i.person_id
+             WHERE p.id = (SELECT person_id FROM drafts WHERE id = ?)
+               AND i.channel = 'gmail'
+               AND i.direction = 'incoming'
+               AND i.occurred_at > ?
+             LIMIT 1
+            """,
+            (row["id"], row["since"]),
+        ).fetchone()
+        if hit and mark_draft_responded(con, row["id"]):
+            detected += 1
+    return {"heuristic_replies_detected": detected}
 
 
 def _to_unix(value: str) -> int:
@@ -380,19 +448,22 @@ def _gmail_headers(message: dict[str, Any]) -> dict[str, str]:
     return out
 
 
-def _ingest_gmail_message(con: sqlite3.Connection, message: dict[str, Any], *, owner: str) -> tuple[int, int]:
+def _ingest_gmail_message(con: sqlite3.Connection, message: dict[str, Any], *, owner: str) -> tuple[int, int, int]:
     headers = _gmail_headers(message)
     senders = parse_addresses(headers.get("from"))
     recipients = parse_addresses(headers.get("to")) + parse_addresses(headers.get("cc"))
     everyone = senders + recipients
     if not everyone:
-        return 0, 0
+        return 0, 0, 0
     sender_email = senders[0][1] if senders else None
     direction = "outgoing" if owner and sender_email == owner else "incoming"
     subject = headers.get("subject")
     snippet = message.get("snippet") or ""
     occurred_at = parse_date(headers.get("date"))
     source_ref = message.get("id") or ""
+    thread_id = message.get("threadId")
+
+    replies = _detect_reply(con, thread_id=thread_id, occurred_at=occurred_at) if direction == "incoming" else 0
 
     people = interactions = 0
     for name, email in everyone:
@@ -410,6 +481,7 @@ def _ingest_gmail_message(con: sqlite3.Connection, message: dict[str, Any], *, o
             occurred_at=occurred_at,
             source="gmail_api",
             source_ref=source_ref,
+            sentiment="reply" if replies else None,
         )
         add_source_fact(
             con,
@@ -433,7 +505,7 @@ def _ingest_gmail_message(con: sqlite3.Connection, message: dict[str, Any], *, o
                 source_ref=source_ref,
                 confidence=0.4,
             )
-    return people, interactions
+    return people, interactions, replies
 
 
 def _build_rfc2822(*, sender: str | None, to: str, subject: str, body: str) -> str:
@@ -505,12 +577,20 @@ def push_drafts_to_gmail(
                 headers=headers,
                 json_body={"message": {"raw": raw}},
             )
+            message = resp.get("message") or {}
+            mark_draft_pushed(
+                con,
+                row["id"],
+                thread_id=message.get("threadId"),
+                message_id=message.get("id"),
+            )
             pushed.append(
                 {
                     "draft_id": row["id"],
                     "to": row["primary_email"],
                     "name": row["full_name"],
                     "gmail_draft_id": (resp.get("id") or ""),
+                    "thread_id": message.get("threadId") or "",
                 }
             )
         except Exception as exc:  # pragma: no cover - reported per-draft

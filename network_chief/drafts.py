@@ -193,10 +193,22 @@ def list_drafts(con: sqlite3.Connection, status: str | None = "draft") -> list[d
     return rows_to_dicts(rows)
 
 
-def set_draft_status(con: sqlite3.Connection, draft_id: str, status: str) -> bool:
+def set_draft_status(
+    con: sqlite3.Connection,
+    draft_id: str,
+    status: str,
+    *,
+    reason: str | None = None,
+) -> bool:
     cur = con.execute(
-        "UPDATE drafts SET status = ?, updated_at = ? WHERE id = ?",
-        (status, now_iso(), draft_id),
+        """
+        UPDATE drafts
+           SET status = ?,
+               rejection_reason = CASE WHEN ? = 'rejected' THEN ? ELSE rejection_reason END,
+               updated_at = ?
+         WHERE id = ?
+        """,
+        (status, status, reason, now_iso(), draft_id),
     )
     con.commit()
     return cur.rowcount > 0

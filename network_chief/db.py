@@ -173,9 +173,17 @@ def init_db(con: sqlite3.Connection) -> None:
             body TEXT NOT NULL,
             rationale TEXT,
             status TEXT NOT NULL DEFAULT 'draft',
+            rejection_reason TEXT,
+            gmail_thread_id TEXT,
+            gmail_message_id TEXT,
+            sent_at TEXT,
+            responded_at TEXT,
+            outcome TEXT NOT NULL DEFAULT 'pending',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+
+        CREATE INDEX IF NOT EXISTS idx_drafts_created ON drafts(created_at);
 
         CREATE TABLE IF NOT EXISTS source_facts (
             id TEXT PRIMARY KEY,
@@ -234,9 +242,45 @@ def init_db(con: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_review_snapshots_window_time
             ON review_snapshots(window_days, captured_at DESC);
+
+        CREATE TABLE IF NOT EXISTS goal_milestones (
+            id TEXT PRIMARY KEY,
+            goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+            metric_name TEXT NOT NULL,
+            target_value REAL NOT NULL DEFAULT 1,
+            current_value REAL NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_goal_milestones_goal ON goal_milestones(goal_id);
+
+        CREATE INDEX IF NOT EXISTS idx_interactions_created ON interactions(created_at);
         """
     )
+    _migrate(con)
     con.commit()
+
+
+def _migrate(con: sqlite3.Connection) -> None:
+    """Idempotently add columns introduced after the first release.
+
+    ``CREATE TABLE IF NOT EXISTS`` does not add columns to a table that
+    already exists, so existing databases need explicit ALTERs. Safe to
+    run on every init — ``ADD COLUMN`` is a no-op once the column exists.
+    """
+    drafts_cols = {row[1] for row in con.execute("PRAGMA table_info(drafts)").fetchall()}
+    for column, decl in (
+        ("rejection_reason", "TEXT"),
+        ("gmail_thread_id", "TEXT"),
+        ("gmail_message_id", "TEXT"),
+        ("sent_at", "TEXT"),
+        ("responded_at", "TEXT"),
+        ("outcome", "TEXT NOT NULL DEFAULT 'pending'"),
+    ):
+        if column not in drafts_cols:
+            con.execute(f"ALTER TABLE drafts ADD COLUMN {column} {decl}")
+    # Index on the (possibly just-added) thread column must come after the ALTER.
+    con.execute("CREATE INDEX IF NOT EXISTS idx_drafts_thread ON drafts(gmail_thread_id)")
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -720,4 +764,82 @@ def list_goals(con: sqlite3.Connection, status: str | None = "active") -> list[d
         rows = con.execute("SELECT * FROM goals ORDER BY created_at DESC").fetchall()
     else:
         rows = con.execute("SELECT * FROM goals WHERE status = ? ORDER BY created_at DESC", (status,)).fetchall()
+    return rows_to_dicts(rows)
+
+
+def mark_draft_pushed(
+    con: sqlite3.Connection,
+    draft_id: str,
+    *,
+    thread_id: str | None,
+    message_id: str | None,
+) -> None:
+    con.execute(
+        """
+        UPDATE drafts
+           SET gmail_thread_id = ?,
+               gmail_message_id = ?,
+               sent_at = COALESCE(sent_at, ?),
+               outcome = CASE WHEN outcome = 'responded' THEN outcome ELSE 'pending' END,
+               updated_at = ?
+         WHERE id = ?
+        """,
+        (thread_id, message_id, now_iso(), now_iso(), draft_id),
+    )
+    con.commit()
+
+
+def mark_draft_responded(con: sqlite3.Connection, draft_id: str, *, responded_at: str | None = None) -> bool:
+    ts = now_iso()
+    cur = con.execute(
+        """
+        UPDATE drafts
+           SET outcome = 'responded',
+               responded_at = COALESCE(responded_at, ?),
+               updated_at = ?
+         WHERE id = ? AND outcome != 'responded'
+        """,
+        (responded_at or ts, ts, draft_id),
+    )
+    con.commit()
+    return cur.rowcount > 0
+
+
+def add_goal_milestone(
+    con: sqlite3.Connection,
+    *,
+    goal_id: str,
+    metric_name: str,
+    target_value: float = 1.0,
+    current_value: float = 0.0,
+) -> str:
+    ts = now_iso()
+    milestone_id = new_id()
+    con.execute(
+        """
+        INSERT INTO goal_milestones (id, goal_id, metric_name, target_value, current_value, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (milestone_id, goal_id, metric_name, float(target_value), float(current_value), ts),
+    )
+    con.commit()
+    return milestone_id
+
+
+def update_goal_milestone(con: sqlite3.Connection, milestone_id: str, *, current_value: float) -> bool:
+    cur = con.execute(
+        "UPDATE goal_milestones SET current_value = ?, updated_at = ? WHERE id = ?",
+        (float(current_value), now_iso(), milestone_id),
+    )
+    con.commit()
+    return cur.rowcount > 0
+
+
+def list_goal_milestones(con: sqlite3.Connection, goal_id: str | None = None) -> list[dict[str, Any]]:
+    if goal_id is None:
+        rows = con.execute("SELECT * FROM goal_milestones ORDER BY updated_at DESC").fetchall()
+    else:
+        rows = con.execute(
+            "SELECT * FROM goal_milestones WHERE goal_id = ? ORDER BY metric_name", (goal_id,)
+        ).fetchall()
     return rows_to_dicts(rows)

@@ -12,7 +12,17 @@ from .brief import build_daily_brief, mindmap_json
 from .cleanup import delete_people, find_misclassified
 from .dashboard import compute_dashboard, previous_snapshot, render_markdown, save_snapshot
 from .review import compute_review, previous_review, render_review_markdown, save_review
-from .db import connect, create_goal, db_path_from_env, init_db, list_connection_values, list_goals, record_source_run
+from .db import (
+    add_goal_milestone,
+    connect,
+    create_goal,
+    db_path_from_env,
+    init_db,
+    list_connection_values,
+    list_goals,
+    record_source_run,
+    update_goal_milestone,
+)
 from .graph import render_graph_markdown
 from .drafts import list_drafts, set_draft_status
 from .discovery import discover_telegram_handles, import_telegram_csv, set_telegram_handle
@@ -27,6 +37,7 @@ from .engagement import (
 from .importers.gmail import import_gmail_json, import_gmail_mbox
 from .importers.google_api import (
     auth_google,
+    detect_replies_heuristic,
     download_drive_file,
     push_drafts_to_gmail,
     revoke_google,
@@ -158,6 +169,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     reject = sub.add_parser("reject-draft", help="Mark a draft as rejected.")
     reject.add_argument("--id", required=True)
+    reject.add_argument(
+        "--reason",
+        help="Why rejected (feeds the review rejection-pattern rule). "
+        "Suggested: wrong_timing | weak_context | wrong_channel | too_transactional | duplicate | not_relevant.",
+    )
+
+    add_ms = sub.add_parser("add-milestone", help="Add a measurable milestone to a goal.")
+    add_ms.add_argument("--goal-id", required=True)
+    add_ms.add_argument("--metric", required=True, help="Metric name, e.g. 'warm investor conversations'.")
+    add_ms.add_argument("--target", type=float, default=1.0)
+    add_ms.add_argument("--current", type=float, default=0.0)
+
+    upd_ms = sub.add_parser("update-milestone", help="Update a goal milestone's current value.")
+    upd_ms.add_argument("--id", required=True)
+    upd_ms.add_argument("--current", type=float, required=True)
 
     mindmap = sub.add_parser("mindmap", help="Export graph-style mind map JSON.")
     mindmap.add_argument("--out", help="Write JSON to a file.")
@@ -197,6 +223,11 @@ def build_parser() -> argparse.ArgumentParser:
     sync_g.add_argument("--since", help="ISO date or unix seconds; only used for Gmail.")
     sync_g.add_argument("--skip-people", action="store_true")
     sync_g.add_argument("--skip-gmail", action="store_true")
+    sync_g.add_argument(
+        "--heuristic",
+        action="store_true",
+        help="Also mark pending drafts (sent outside this tool) as responded when the recipient emailed back.",
+    )
 
     sync_x_p = sub.add_parser("sync-x", help="Pull X.com following list + recent mentions.")
     sync_x_p.add_argument("--limit", type=int)
@@ -320,6 +351,8 @@ _STATE_CHANGING_COMMANDS = frozenset(
         "approve-draft",
         "reject-draft",
         "add-goal",
+        "add-milestone",
+        "update-milestone",
         "cleanup-people",
         "push-drafts",
         "discover-telegram",
@@ -474,10 +507,28 @@ def _dispatch(args, con) -> int:
         return 0
 
     if args.command == "reject-draft":
-        if not set_draft_status(con, args.id, "rejected"):
+        if not set_draft_status(con, args.id, "rejected", reason=args.reason):
             print(f"Draft not found: {args.id}", file=sys.stderr)
             return 1
-        print(f"Rejected draft {args.id}")
+        print(f"Rejected draft {args.id}" + (f" (reason: {args.reason})" if args.reason else ""))
+        return 0
+
+    if args.command == "add-milestone":
+        milestone_id = add_goal_milestone(
+            con,
+            goal_id=args.goal_id,
+            metric_name=args.metric,
+            target_value=args.target,
+            current_value=args.current,
+        )
+        print(milestone_id)
+        return 0
+
+    if args.command == "update-milestone":
+        if not update_goal_milestone(con, args.id, current_value=args.current):
+            print(f"Milestone not found: {args.id}", file=sys.stderr)
+            return 1
+        print(f"Updated milestone {args.id} → {args.current:g}")
         return 0
 
     if args.command == "mindmap":
@@ -583,6 +634,9 @@ def _dispatch(args, con) -> int:
                 record_source_run(con, source="gmail_api", source_ref=None, status=stats.get("status", "ok"), stats=stats)
                 combined["gmail"] = stats
                 print(f"gmail messages: {stats}")
+            if args.heuristic:
+                h = detect_replies_heuristic(con)
+                print(f"heuristic reply detection: {h}")
         except AuthRequired as exc:
             print(f"sync-google: {exc}", file=sys.stderr)
             return 2

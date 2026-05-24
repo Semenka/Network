@@ -147,6 +147,19 @@ def compute_review(con: sqlite3.Connection, *, window_days: int = 7) -> dict[str
     )
     subject_diversity = round(distinct_subjects / drafts_created, 3) if drafts_created else None
 
+    rejection_reasons = rows_to_dicts(
+        con.execute(
+            """
+            SELECT COALESCE(rejection_reason, 'unspecified') AS reason, count(*) AS n
+              FROM drafts
+             WHERE status = 'rejected' AND updated_at >= ?
+             GROUP BY reason
+             ORDER BY n DESC
+            """,
+            (floor,),
+        ).fetchall()
+    )
+
     kpi_rows = rows_to_dicts(
         con.execute(
             """
@@ -215,6 +228,7 @@ def compute_review(con: sqlite3.Connection, *, window_days: int = 7) -> dict[str
             "drafts_rejected": drafts_rejected,
             "approval_rate_pct": approval_rate,
             "channel_mix": channel_mix,
+            "rejection_reasons": rejection_reasons,
             "subject_diversity": subject_diversity,
             "distinct_subjects": distinct_subjects,
             "pending_drafts": pending_drafts,
@@ -376,6 +390,26 @@ def _r_low_approval_rate(r: dict[str, Any]) -> Finding | None:
     }
 
 
+def _r_rejection_pattern(r: dict[str, Any]) -> Finding | None:
+    reasons = r["pipeline"].get("rejection_reasons") or []
+    total = sum(int(x["n"]) for x in reasons)
+    if total < 3:
+        return None
+    top = max(reasons, key=lambda x: int(x["n"]))
+    share = top["n"] / total
+    if share <= 0.3 or top["reason"] == "unspecified":
+        return None
+    return {
+        "severity": SEV_ATTENTION,
+        "headline": (
+            f"{int(share * 100)}% of rejections are '{top['reason']}' "
+            f"({top['n']}/{total}) — a fixable template/timing pattern."
+        ),
+        "evidence": f"rejection_reasons={reasons}",
+        "command": "network-chief drafts --status rejected   # inspect the dominant reason and tune templates",
+    }
+
+
 def _r_cadence_gap(r: dict[str, Any]) -> Finding | None:
     state = r["state"]
     if state["snapshot_count_in_window"] >= 2:
@@ -399,6 +433,7 @@ RULES: list[Callable[[dict[str, Any]], Finding | None]] = [
     _r_subject_diversity,
     _r_stale_backlog,
     _r_low_approval_rate,
+    _r_rejection_pattern,
     _r_cadence_gap,
 ]
 
