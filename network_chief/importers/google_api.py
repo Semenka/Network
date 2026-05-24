@@ -554,6 +554,7 @@ def push_drafts_to_gmail(
           FROM drafts d JOIN people p ON p.id = d.person_id
          WHERE d.status = ?
            AND p.primary_email IS NOT NULL AND p.primary_email != ''
+           AND COALESCE(p.consent_status, 'active') = 'active'
          ORDER BY d.created_at
          LIMIT ?
         """,

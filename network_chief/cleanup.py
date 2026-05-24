@@ -14,6 +14,8 @@ import re
 import sqlite3
 from typing import Any
 
+from .db import now_iso
+
 
 _EMAIL_LIKE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 _DOMAIN_LIKE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9\-_.]+\.(com|io|net|org|ai|co|app|dev)$", re.I)
@@ -78,3 +80,55 @@ def delete_people(con: sqlite3.Connection, person_ids: list[str]) -> int:
     cur = con.execute(f"DELETE FROM people WHERE id IN ({placeholders})", tuple(person_ids))
     con.commit()
     return cur.rowcount
+
+
+def merge_people(con: sqlite3.Connection, *, primary_id: str, duplicate_ids: list[str]) -> dict[str, Any]:
+    """Merge duplicate person rows into ``primary_id``, then delete the duplicates.
+
+    Re-points all child rows (roles, resources, connection_values,
+    relationships, interactions, drafts, source_facts) from each duplicate
+    to the primary. UNIQUE constraints are respected with ``UPDATE OR
+    IGNORE`` — rows that would collide are left on the duplicate and removed
+    by the cascading delete. Also backfills primary's empty identity fields
+    (email/phone/linkedin/twitter/telegram/location/notes) from duplicates.
+    """
+    dupes = [d for d in duplicate_ids if d and d != primary_id]
+    if not dupes:
+        return {"merged": 0, "primary_id": primary_id}
+    primary = con.execute("SELECT * FROM people WHERE id = ?", (primary_id,)).fetchone()
+    if primary is None:
+        return {"merged": 0, "primary_id": primary_id, "reason": "primary not found"}
+
+    fill_fields = (
+        "primary_email", "phone", "linkedin_url", "instagram_handle",
+        "twitter_handle", "telegram_handle", "whatsapp_phone", "location",
+    )
+    backfill: dict[str, str] = {}
+    merged = 0
+    for dup_id in dupes:
+        dup = con.execute("SELECT * FROM people WHERE id = ?", (dup_id,)).fetchone()
+        if dup is None:
+            continue
+        # Re-point child rows. relationships/connection_values/resources have
+        # UNIQUE constraints involving person_id → UPDATE OR IGNORE leaves any
+        # colliding row on the duplicate, to be removed by the delete below.
+        for table in ("roles", "resources", "connection_values", "relationships",
+                      "interactions", "drafts", "source_facts"):
+            con.execute(
+                f"UPDATE OR IGNORE {table} SET person_id = ? WHERE person_id = ?",
+                (primary_id, dup_id),
+            )
+        # Stage identity backfill (apply AFTER deleting dupes to avoid the
+        # people UNIQUE indexes on email/linkedin/twitter).
+        for field in fill_fields:
+            if field not in backfill and not (primary[field] or "").strip() and (dup[field] or "").strip():
+                backfill[field] = dup[field]
+        merged += 1
+
+    placeholders = ",".join(["?"] * len(dupes))
+    con.execute(f"DELETE FROM people WHERE id IN ({placeholders})", tuple(dupes))
+    for field, value in backfill.items():
+        con.execute(f"UPDATE people SET {field} = ? WHERE id = ?", (value, primary_id))
+    con.execute("UPDATE people SET updated_at = ? WHERE id = ?", (now_iso(), primary_id))
+    con.commit()
+    return {"merged": merged, "primary_id": primary_id}

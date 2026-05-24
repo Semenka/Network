@@ -49,6 +49,7 @@ def init_db(con: sqlite3.Connection) -> None:
             whatsapp_phone TEXT,
             location TEXT,
             notes TEXT,
+            consent_status TEXT NOT NULL DEFAULT 'active',
             confidence REAL NOT NULL DEFAULT 0.5,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -281,6 +282,10 @@ def _migrate(con: sqlite3.Connection) -> None:
             con.execute(f"ALTER TABLE drafts ADD COLUMN {column} {decl}")
     # Index on the (possibly just-added) thread column must come after the ALTER.
     con.execute("CREATE INDEX IF NOT EXISTS idx_drafts_thread ON drafts(gmail_thread_id)")
+
+    people_cols = {row[1] for row in con.execute("PRAGMA table_info(people)").fetchall()}
+    if "consent_status" not in people_cols:
+        con.execute("ALTER TABLE people ADD COLUMN consent_status TEXT NOT NULL DEFAULT 'active'")
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -765,6 +770,42 @@ def list_goals(con: sqlite3.Connection, status: str | None = "active") -> list[d
     else:
         rows = con.execute("SELECT * FROM goals WHERE status = ? ORDER BY created_at DESC", (status,)).fetchall()
     return rows_to_dicts(rows)
+
+
+CONSENT_STATUSES = ("active", "paused", "opted_out")
+
+
+def set_consent_status(
+    con: sqlite3.Connection,
+    *,
+    status: str,
+    person_id: str | None = None,
+    email: str | None = None,
+    linkedin_url: str | None = None,
+    full_name: str | None = None,
+) -> dict[str, Any]:
+    """Set people.consent_status by id, email, linkedin_url, or full_name."""
+    if status not in CONSENT_STATUSES:
+        return {"matched": False, "reason": f"status must be one of {CONSENT_STATUSES}"}
+    row = None
+    if person_id:
+        row = con.execute("SELECT id, full_name FROM people WHERE id = ?", (person_id,)).fetchone()
+    elif email:
+        row = con.execute(
+            "SELECT id, full_name FROM people WHERE lower(primary_email) = lower(?)", (email,)
+        ).fetchone()
+    elif linkedin_url:
+        row = con.execute("SELECT id, full_name FROM people WHERE linkedin_url = ?", (linkedin_url,)).fetchone()
+    elif full_name:
+        row = con.execute("SELECT id, full_name FROM people WHERE lower(full_name) = lower(?)", (full_name,)).fetchone()
+    if not row:
+        return {"matched": False, "reason": "no person matched"}
+    con.execute(
+        "UPDATE people SET consent_status = ?, updated_at = ? WHERE id = ?",
+        (status, now_iso(), row["id"]),
+    )
+    con.commit()
+    return {"matched": True, "person_id": row["id"], "full_name": row["full_name"], "status": status}
 
 
 def mark_draft_pushed(

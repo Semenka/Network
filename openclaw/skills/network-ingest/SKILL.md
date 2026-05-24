@@ -41,6 +41,14 @@ network-chief connection-values --limit 30
 network-chief mindmap --out data/network-map.json
 ```
 
+Deduplicate after multi-source imports (LinkedIn + Google + X create overlaps):
+
+```bash
+network-chief cleanup-people                       # dry-run: list email/domain/org-as-name noise
+network-chief cleanup-people --delete              # remove it
+network-chief merge-people --into <keep-id> --from <dup-id>[,<dup-id>...]   # fold duplicates' history into one row
+```
+
 Safety:
 
 - Do not commit imported data.

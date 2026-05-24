@@ -225,13 +225,19 @@ def fetch_people_for_ranking(con: sqlite3.Connection) -> list[dict[str, Any]]:
             MAX(connection_values.score) AS max_connection_value_score,
             group_concat(DISTINCT organizations.name) AS organizations,
             group_concat(DISTINCT roles.title) AS titles,
-            (SELECT count(*) FROM drafts d WHERE d.person_id = p.id AND d.outcome = 'responded') AS responded_drafts
+            (SELECT count(*) FROM drafts d WHERE d.person_id = p.id AND d.outcome = 'responded') AS responded_drafts,
+            (
+                SELECT i.subject FROM interactions i
+                 WHERE i.person_id = p.id AND i.subject IS NOT NULL AND i.subject != ''
+                 ORDER BY i.occurred_at DESC LIMIT 1
+            ) AS last_interaction_subject
         FROM people p
         LEFT JOIN relationships rel ON rel.person_id = p.id
         LEFT JOIN resources ON resources.person_id = p.id
         LEFT JOIN connection_values ON connection_values.person_id = p.id
         LEFT JOIN roles ON roles.person_id = p.id
         LEFT JOIN organizations ON organizations.id = roles.organization_id
+        WHERE COALESCE(p.consent_status, 'active') = 'active'
         GROUP BY p.id
         """
     ).fetchall()

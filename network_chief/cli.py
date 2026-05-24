@@ -9,7 +9,7 @@ from pathlib import Path
 from .auth.errors import AuthRequired, OAuthError, RateLimited
 from .auth.tokens import TokenStore
 from .brief import build_daily_brief, mindmap_json
-from .cleanup import delete_people, find_misclassified
+from .cleanup import delete_people, find_misclassified, merge_people
 from .dashboard import compute_dashboard, previous_snapshot, render_markdown, save_snapshot
 from .review import compute_review, previous_review, render_review_markdown, save_review
 from .db import (
@@ -21,6 +21,7 @@ from .db import (
     list_connection_values,
     list_goals,
     record_source_run,
+    set_consent_status,
     update_goal_milestone,
 )
 from .graph import render_graph_markdown
@@ -269,6 +270,24 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup.add_argument("--delete", action="store_true", help="Actually delete; default is dry-run.")
     cleanup.add_argument("--limit", type=int, help="Only show/delete the first N candidates.")
 
+    merge = sub.add_parser(
+        "merge-people",
+        help="Merge duplicate person rows into one, re-pointing all their history.",
+    )
+    merge.add_argument("--into", required=True, help="Primary person id to keep.")
+    merge.add_argument("--from", dest="from_ids", required=True, help="Comma-separated duplicate person id(s) to merge in.")
+
+    consent = sub.add_parser(
+        "set-consent",
+        help="Set a contact's consent status; non-active contacts are excluded from ranking and outreach.",
+    )
+    consent.add_argument("--status", required=True, choices=["active", "paused", "opted_out"])
+    consent_group = consent.add_mutually_exclusive_group(required=True)
+    consent_group.add_argument("--id")
+    consent_group.add_argument("--email")
+    consent_group.add_argument("--linkedin-url")
+    consent_group.add_argument("--name")
+
     push = sub.add_parser(
         "push-drafts",
         help="Push pending network-chief drafts into the user's Gmail Drafts (read-and-write Google scope required).",
@@ -354,6 +373,8 @@ _STATE_CHANGING_COMMANDS = frozenset(
         "add-milestone",
         "update-milestone",
         "cleanup-people",
+        "merge-people",
+        "set-consent",
         "push-drafts",
         "discover-telegram",
         "set-telegram",
@@ -770,6 +791,27 @@ def _dispatch(args, con) -> int:
         if args.delete:
             removed = delete_people(con, [c["id"] for c in candidates])
             print(f"Deleted {removed} people (cascade cleaned roles/interactions/values).")
+        return 0
+
+    if args.command == "merge-people":
+        dupes = [d.strip() for d in args.from_ids.split(",") if d.strip()]
+        result = merge_people(con, primary_id=args.into, duplicate_ids=dupes)
+        print(result)
+        return 0
+
+    if args.command == "set-consent":
+        result = set_consent_status(
+            con,
+            status=args.status,
+            person_id=args.id,
+            email=args.email,
+            linkedin_url=args.linkedin_url,
+            full_name=args.name,
+        )
+        if not result["matched"]:
+            print(f"set-consent: {result.get('reason', 'no match')}", file=sys.stderr)
+            return 1
+        print(f"set consent for {result['full_name']} → {result['status']}")
         return 0
 
     if args.command == "import-drive":

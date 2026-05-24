@@ -54,6 +54,7 @@ def render_telegram_links(con: sqlite3.Connection, *, status: str = "draft", lim
          WHERE d.channel = 'telegram'
            AND d.status = ?
            AND p.telegram_handle IS NOT NULL AND p.telegram_handle != ''
+           AND COALESCE(p.consent_status, 'active') = 'active'
          ORDER BY d.created_at DESC
     """
     params: list[Any] = [status]

@@ -43,6 +43,14 @@ Outcome tracking (closed loop):
 - People who reply get a ranking bonus (they surface higher in the next `brief`).
 - For drafts you sent manually (no stored thread), `network-chief sync-google --heuristic` infers a reply when the recipient emails back after the draft was sent.
 
+Do-not-contact:
+
+```bash
+network-chief set-consent --email someone@example.com --status opted_out   # or: paused | active
+```
+
+Contacts with consent_status other than `active` are excluded from ranking, brief, keepalive, Gmail push, and Telegram links. Use this before any bulk outreach to honour opt-outs.
+
 Outbound rule:
 
 - Approved means "ready to send."
