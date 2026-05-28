@@ -73,6 +73,18 @@ def _write_or_print(content: str, out: str | None) -> None:
         print(content)
 
 
+def _parse_interval(text: str) -> int:
+    """Parse '30m' / '6h' / '1d' / '900' (seconds) into seconds."""
+    text = (text or "").strip().lower()
+    if not text:
+        return 21600
+    unit = text[-1]
+    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}.get(unit)
+    if mult is None:
+        return int(text)  # bare seconds
+    return int(float(text[:-1]) * mult)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="network-chief", description="Local-first chief-of-network agent.")
     parser.add_argument("--db", help="SQLite database path. Defaults to NETWORK_CHIEF_DB or data/network.db.")
@@ -346,6 +358,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     drv.add_argument("--owner", help="Mailbox owner / LinkedIn handle / X handle, passed through to the importer.")
     drv.add_argument("--limit", type=int, help="Optional row limit for the chosen importer.")
+
+    auto = sub.add_parser(
+        "autopilot",
+        help="Run the autonomous SENSE->THINK->ACT->REPORT cycle once (or loop). Outbound gated by policy.",
+    )
+    auto.add_argument("--once", action="store_true", default=True, help="Run a single cycle and exit (default).")
+    auto.add_argument("--loop", action="store_true", help="Run forever, sleeping --interval between cycles.")
+    auto.add_argument("--interval", default="6h", help="Loop interval, e.g. 30m, 6h, 1d (used with --loop).")
+    auto.add_argument("--dry-run", action="store_true", help="Force policy.dry_run for this run (no sends).")
+    auto.add_argument("--level", type=int, choices=[0, 1, 2], help="Override autonomy level for this run only.")
+
+    pol = sub.add_parser("policy", help="Show or set the autonomy policy that gates autonomous sending.")
+    pol_sub = pol.add_subparsers(dest="policy_cmd", required=True)
+    pol_sub.add_parser("show", help="Print the current autonomy policy as JSON.")
+    pol_set = pol_sub.add_parser("set", help="Update autonomy policy fields.")
+    pol_set.add_argument("--level", type=int, choices=[0, 1, 2])
+    pol_set.add_argument("--dry-run", dest="dry_run", choices=["true", "false"])
+    pol_set.add_argument("--daily-send-cap", type=int)
+    pol_set.add_argument("--min-days-between-touches", type=int)
+    pol_set.add_argument("--require-prior-reply", choices=["true", "false"])
+    pol_set.add_argument("--require-existing-contact", choices=["true", "false"])
+    pol_set.add_argument("--channels", help="Comma-separated channels enabled for sending, e.g. gmail.")
+    pol_set.add_argument("--quiet-hours", help="START,END local hours with no sends, e.g. 21,8.")
 
     return parser
 
@@ -679,6 +714,73 @@ def _dispatch(args, con) -> int:
         except RateLimited as exc:
             print(f"sync-x rate-limited (reset_at={exc.reset_at}): {exc}", file=sys.stderr)
             return 0
+        return 0
+
+    if args.command == "policy":
+        from .policy import load_policy, save_policy
+        if args.policy_cmd == "show":
+            print(json.dumps(load_policy(args.db).to_json(), indent=2, sort_keys=True))
+            return 0
+        # set
+        policy = load_policy(args.db)
+        if args.level is not None:
+            policy.level = args.level
+        if args.dry_run is not None:
+            policy.dry_run = args.dry_run == "true"
+        if args.daily_send_cap is not None:
+            policy.daily_send_cap = args.daily_send_cap
+        if args.min_days_between_touches is not None:
+            policy.min_days_between_touches = args.min_days_between_touches
+        if args.require_prior_reply is not None:
+            policy.require_prior_reply = args.require_prior_reply == "true"
+        if args.require_existing_contact is not None:
+            policy.require_existing_contact = args.require_existing_contact == "true"
+        if args.channels is not None:
+            policy.channels_enabled = tuple(c.strip() for c in args.channels.split(",") if c.strip())
+        if args.quiet_hours is not None:
+            parts = [int(x) for x in args.quiet_hours.split(",")]
+            policy.quiet_hours = (parts[0], parts[1])
+        path = save_policy(policy, args.db)
+        # Loud confirmation when arming real sends.
+        if policy.level >= 1 and not policy.dry_run:
+            print(f"⚠ ARMED: autopilot will SEND at level {policy.level} (cap {policy.daily_send_cap}/day). Wrote {path}")
+        else:
+            print(f"Wrote {path} (level={policy.level}, dry_run={policy.dry_run})")
+        return 0
+
+    if args.command == "autopilot":
+        from .orchestrator import run_cycle
+        from .policy import load_policy
+        policy = load_policy(args.db)
+        if args.level is not None:
+            policy.level = args.level
+        if args.dry_run:
+            policy.dry_run = True
+
+        def _one() -> dict:
+            res = run_cycle(con, policy=policy)
+            steps = res.get("steps", [])
+            ok = sum(1 for s in steps if s["status"] == "ok")
+            skipped = sum(1 for s in steps if s["status"] == "skipped")
+            errored = sum(1 for s in steps if s["status"] == "error")
+            send = res.get("send") or {}
+            print(f"autopilot cycle: {ok} ok / {skipped} skipped / {errored} error · "
+                  f"sent={send.get('sent', 0)} dry={send.get('dry_run', 0)} blocked={send.get('blocked', 0)} · "
+                  f"auto-actions={len(res.get('auto_actions', []))}")
+            return res
+
+        if args.loop:
+            import time
+            seconds = _parse_interval(args.interval)
+            print(f"autopilot loop: every {args.interval} ({seconds}s). Ctrl-C to stop.")
+            try:
+                while True:
+                    _one()
+                    time.sleep(max(60, seconds))
+            except KeyboardInterrupt:
+                print("autopilot loop stopped.")
+            return 0
+        _one()
         return 0
 
     if args.command == "agent-review":

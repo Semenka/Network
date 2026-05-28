@@ -451,6 +451,8 @@ def _run_rules(review: dict[str, Any]) -> list[Finding]:
                 "command": "",
             }
         if out:
+            # Stable machine key for self-direction dispatch (orchestrator).
+            out.setdefault("rule", rule.__name__)
             findings.append(out)
     if not findings:
         findings.append(

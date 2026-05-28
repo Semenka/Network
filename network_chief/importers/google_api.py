@@ -32,6 +32,7 @@ from ..db import (
     get_or_create_org,
     mark_draft_pushed,
     mark_draft_responded,
+    now_iso,
     upsert_person,
 )
 from ..scoring import infer_connection_values_from_text
@@ -47,12 +48,14 @@ SCOPE_OPENID = "openid email"
 SCOPE_PEOPLE = "https://www.googleapis.com/auth/contacts.readonly"
 SCOPE_GMAIL = "https://www.googleapis.com/auth/gmail.readonly"
 SCOPE_GMAIL_COMPOSE = "https://www.googleapis.com/auth/gmail.compose"
-DEFAULT_SCOPES = " ".join((SCOPE_OPENID, SCOPE_PEOPLE, SCOPE_GMAIL, SCOPE_GMAIL_COMPOSE))
+SCOPE_GMAIL_SEND = "https://www.googleapis.com/auth/gmail.send"
+DEFAULT_SCOPES = " ".join((SCOPE_OPENID, SCOPE_PEOPLE, SCOPE_GMAIL, SCOPE_GMAIL_COMPOSE, SCOPE_GMAIL_SEND))
 
 PEOPLE_URL = "https://people.googleapis.com/v1/people/me/connections"
 GMAIL_LIST_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
 GMAIL_GET_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages/{id}"
 GMAIL_DRAFTS_URL = "https://gmail.googleapis.com/gmail/v1/users/me/drafts"
+GMAIL_SEND_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
 DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files/{id}"
 DRIVE_EXPORT_URL = "https://www.googleapis.com/drive/v3/files/{id}/export"
 USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
@@ -599,6 +602,113 @@ def push_drafts_to_gmail(
             errors.append(f"{row['full_name']}: {exc}")
 
     return {"pushed": len(pushed), "skipped": skipped, "items": pushed, "errors": errors}
+
+
+def send_drafts_via_gmail(
+    con: sqlite3.Connection,
+    *,
+    policy,
+    status: str = "approved",
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """Autonomously SEND approved drafts via Gmail, gated by ``policy``.
+
+    Mirrors ``push_drafts_to_gmail`` selection (active consent + verified
+    email), but each draft is additionally checked through
+    ``policy.permits_send``. On a real send the draft is marked sent
+    (``status='sent'``, ``sent_at`` set). Honors ``policy.dry_run`` — when
+    set, the message is fully prepared and logged but no API call is made.
+
+    Returns counts: sent, dry_run, blocked (with reasons), errors.
+    """
+    from ..policy import permits_send  # local import avoids a cycle at module load
+
+    record = _ensure_token(con)
+    scopes = (record.get("scopes") or "").split()
+    if SCOPE_GMAIL_SEND not in scopes and "https://www.googleapis.com/auth/gmail.modify" not in scopes:
+        raise AuthRequired(
+            "Saved Google token lacks gmail.send scope. Re-run "
+            "`network-chief auth-google --manual` to grant send capability."
+        )
+    headers = {**_authed_headers(record), "Content-Type": "application/json"}
+    sender = record.get("account") or None
+
+    rows = con.execute(
+        """
+        SELECT d.id, d.person_id, d.subject, d.body, d.gmail_thread_id,
+               p.full_name, p.primary_email, p.consent_status
+          FROM drafts d JOIN people p ON p.id = d.person_id
+         WHERE d.status = ?
+           AND d.channel = 'gmail'
+           AND p.primary_email IS NOT NULL AND p.primary_email != ''
+           AND COALESCE(p.consent_status, 'active') = 'active'
+         ORDER BY d.created_at
+         LIMIT ?
+        """,
+        (status, limit or 1000),
+    ).fetchall()
+
+    # Count sends already made today (UTC) for the daily cap.
+    todays_sends = con.execute(
+        "SELECT count(*) FROM drafts WHERE sent_at >= strftime('%Y-%m-%dT00:00:00Z','now')"
+    ).fetchone()[0]
+
+    sent: list[dict[str, str]] = []
+    dry: list[dict[str, str]] = []
+    blocked: list[dict[str, str]] = []
+    errors: list[str] = []
+
+    for row in rows:
+        draft = dict(row)
+        allowed, reason = permits_send(
+            policy, con, draft, todays_sends=todays_sends + len(sent) + len(dry), channel="gmail"
+        )
+        if not allowed:
+            blocked.append({"name": draft["full_name"], "to": draft["primary_email"], "reason": reason})
+            continue
+
+        if policy.dry_run:
+            dry.append({"draft_id": draft["id"], "to": draft["primary_email"], "name": draft["full_name"]})
+            continue
+
+        try:
+            raw = _build_rfc2822(
+                sender=sender,
+                to=draft["primary_email"],
+                subject=draft["subject"] or "(no subject)",
+                body=draft["body"] or "",
+            )
+            payload: dict[str, Any] = {"raw": raw}
+            if draft.get("gmail_thread_id"):
+                payload["threadId"] = draft["gmail_thread_id"]
+            resp = request_json("POST", GMAIL_SEND_URL, headers=headers, json_body=payload)
+            con.execute(
+                """
+                UPDATE drafts
+                   SET status = 'sent',
+                       sent_at = ?,
+                       gmail_message_id = COALESCE(?, gmail_message_id),
+                       gmail_thread_id = COALESCE(gmail_thread_id, ?),
+                       outcome = CASE WHEN outcome = 'responded' THEN outcome ELSE 'pending' END,
+                       updated_at = ?
+                 WHERE id = ?
+                """,
+                (now_iso(), resp.get("id"), resp.get("threadId"), now_iso(), draft["id"]),
+            )
+            con.commit()
+            sent.append({"draft_id": draft["id"], "to": draft["primary_email"], "name": draft["full_name"]})
+        except Exception as exc:  # pragma: no cover - reported per-draft
+            errors.append(f"{draft['full_name']}: {exc}")
+
+    return {
+        "sent": len(sent),
+        "dry_run": len(dry),
+        "blocked": len(blocked),
+        "errors": errors,
+        "sent_items": sent,
+        "dry_items": dry,
+        "blocked_items": blocked,
+    }
 
 
 _GOOGLE_NATIVE_EXPORTS: dict[str, tuple[str, str]] = {
