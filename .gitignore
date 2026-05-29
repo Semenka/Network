@@ -23,6 +23,8 @@ dashboards/dashboard-*.md
 dashboards/dashboard-*.json
 dashboards/agent-review-*.md
 dashboards/agent-review-*.json
+dashboards/autopilot-digest.md
+dashboards/autopilot-*.json
 
 # OpenClaw local runtime state.
 .openclaw/
