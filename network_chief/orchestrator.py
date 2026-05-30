@@ -33,13 +33,14 @@ from .engagement import (
     prepare_x_posts,
 )
 from .importers.google_api import (
+    auto_reply_to_gmail,
     detect_replies_heuristic,
     push_drafts_to_gmail,
     send_drafts_via_gmail,
     sync_gmail_messages,
     sync_google_contacts,
 )
-from .importers.x_api import sync_x_following, sync_x_mentions
+from .importers.x_api import post_x_drafts, reply_to_x_mentions, sync_x_following, sync_x_mentions
 from .review import compute_review, previous_review, render_review_markdown, save_review
 from .scoring import rank_people
 from .value import maintain_connection_values
@@ -127,9 +128,19 @@ def run_cycle(con: sqlite3.Connection, *, policy, dashboards_dir: str | None = N
     # Autonomous send is fully gated by the policy (level 0 => nothing sent).
     send = _safe(con, "act", "send_drafts_via_gmail", lambda: send_drafts_via_gmail(con, policy=policy), result)
     result["send"] = send
+    # Auto-acknowledge fresh inbound Gmail (opt-in via policy.gmail_auto_reply_enabled).
+    gmail_reply = _safe(con, "act", "auto_reply_to_gmail", lambda: auto_reply_to_gmail(con, policy=policy), result)
+    result["gmail_auto_reply"] = gmail_reply
+    # Auto-publish X posts (opt-in via policy.x_post_enabled).
+    x_post = _safe(con, "act", "post_x_drafts", lambda: post_x_drafts(con, policy=policy), result)
+    result["x_post"] = x_post
+    # Auto-reply to X mentions (opt-in via policy.x_reply_enabled).
+    x_reply = _safe(con, "act", "reply_to_x_mentions", lambda: reply_to_x_mentions(con, policy=policy), result)
+    result["x_reply"] = x_reply
     record_source_run(con, source="autopilot.act", source_ref=None,
                       status="ok",
-                      stats={"send": send, "level": policy.level, "dry_run": policy.dry_run})
+                      stats={"send": send, "gmail_reply": gmail_reply, "x_post": x_post,
+                             "x_reply": x_reply, "level": policy.level, "dry_run": policy.dry_run})
 
     # ---- REPORT ----------------------------------------------------------
     out_dir = Path(dashboards_dir or os.environ.get("NETWORK_CHIEF_DASHBOARDS_DIR", "dashboards"))
@@ -163,11 +174,32 @@ def render_operator_digest(result: dict[str, Any], policy) -> str:
 
     send = result.get("send") or {}
     if send:
-        out.append("## Outbound")
+        out.append("## Outbound — Gmail (scheduled drafts)")
         out.append(f"- sent: **{send.get('sent', 0)}** · dry-run staged: {send.get('dry_run', 0)} · "
                    f"blocked by policy: {send.get('blocked', 0)} · errors: {len(send.get('errors', []))}")
         for b in (send.get("blocked_items") or [])[:5]:
             out.append(f"  - blocked → {b['name']} <{b['to']}>: {b['reason']}")
+        out.append("")
+
+    gr = result.get("gmail_auto_reply") or {}
+    if gr and (gr.get("considered") or gr.get("reason") and "false" not in gr.get("reason", "")):
+        out.append("## Auto-reply — Gmail")
+        out.append(f"- considered: {gr.get('considered', 0)} · drafted: {gr.get('drafted', 0)} · "
+                   f"sent: **{gr.get('sent', 0)}** · blocked: {gr.get('blocked', 0)}")
+        for r in (gr.get("block_reasons") or [])[:3]:
+            out.append(f"  - blocked: {r}")
+        out.append("")
+
+    xp = result.get("x_post") or {}
+    if xp and (xp.get("posted") or xp.get("dry_run") or (xp.get("reason") and "false" not in xp.get("reason", ""))):
+        out.append("## Auto-publish — X posts")
+        out.append(f"- posted: **{xp.get('posted', 0)}** · dry-run: {xp.get('dry_run', 0)} · blocked: {xp.get('blocked', 0)}")
+        out.append("")
+
+    xr = result.get("x_reply") or {}
+    if xr and (xr.get("replied") or xr.get("dry_run") or (xr.get("reason") and "false" not in xr.get("reason", ""))):
+        out.append("## Auto-reply — X mentions")
+        out.append(f"- replied: **{xr.get('replied', 0)}** · dry-run: {xr.get('dry_run', 0)} · blocked: {xr.get('blocked', 0)}")
         out.append("")
 
     if result.get("auto_actions"):

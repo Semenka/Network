@@ -42,6 +42,11 @@ class AutonomyPolicy:
     require_prior_reply: bool = True  # enforced at L1; dropped at L2
     channels_enabled: tuple[str, ...] = ("gmail",)
     quiet_hours: tuple[int, int] = (21, 8)  # (start_hour, end_hour) local; no sends within
+    # Per-channel auto-action switches. All default off; enabling each is a
+    # deliberate operator action even at L2.
+    gmail_auto_reply_enabled: bool = False
+    x_post_enabled: bool = False
+    x_reply_enabled: bool = False
 
     def to_json(self) -> dict[str, Any]:
         data = asdict(self)

@@ -33,6 +33,7 @@ from .engagement import (
     prepare_telegram_keepalive,
     prepare_x_comments,
     prepare_x_posts,
+    publish_linkedin_assist,
     render_telegram_links,
 )
 from .importers.gmail import import_gmail_json, import_gmail_mbox
@@ -359,6 +360,14 @@ def build_parser() -> argparse.ArgumentParser:
     drv.add_argument("--owner", help="Mailbox owner / LinkedIn handle / X handle, passed through to the importer.")
     drv.add_argument("--limit", type=int, help="Optional row limit for the chosen importer.")
 
+    li_pub = sub.add_parser(
+        "publish-linkedin",
+        help="One-tap LinkedIn publish helper: copies an approved post to clipboard and opens LinkedIn's share dialog.",
+    )
+    li_pub.add_argument("--id", help="Specific linkedin_post draft id (defaults to next approved).")
+    li_pub.add_argument("--no-browser", action="store_true")
+    li_pub.add_argument("--out", help="Also write the body to this file.")
+
     auto = sub.add_parser(
         "autopilot",
         help="Run the autonomous SENSE->THINK->ACT->REPORT cycle once (or loop). Outbound gated by policy.",
@@ -379,8 +388,14 @@ def build_parser() -> argparse.ArgumentParser:
     pol_set.add_argument("--min-days-between-touches", type=int)
     pol_set.add_argument("--require-prior-reply", choices=["true", "false"])
     pol_set.add_argument("--require-existing-contact", choices=["true", "false"])
-    pol_set.add_argument("--channels", help="Comma-separated channels enabled for sending, e.g. gmail.")
+    pol_set.add_argument("--channels", help="Comma-separated channels enabled for sending, e.g. gmail,x.")
     pol_set.add_argument("--quiet-hours", help="START,END local hours with no sends, e.g. 21,8.")
+    pol_set.add_argument("--gmail-auto-reply", dest="gmail_auto_reply", choices=["true", "false"],
+                         help="Enable auto-acknowledge for incoming Gmail from known contacts.")
+    pol_set.add_argument("--x-post", dest="x_post", choices=["true", "false"],
+                         help="Enable auto-publishing of approved x_post drafts.")
+    pol_set.add_argument("--x-reply", dest="x_reply", choices=["true", "false"],
+                         help="Enable auto-replying to recent X mentions.")
 
     return parser
 
@@ -415,6 +430,7 @@ _STATE_CHANGING_COMMANDS = frozenset(
         "set-telegram",
         "import-telegram",
         "prepare-telegram-keepalive",
+        "publish-linkedin",
     }
 )
 
@@ -716,6 +732,21 @@ def _dispatch(args, con) -> int:
             return 0
         return 0
 
+    if args.command == "publish-linkedin":
+        result = publish_linkedin_assist(
+            con,
+            draft_id=args.id,
+            open_browser=not args.no_browser,
+            out_file=args.out,
+        )
+        if not result.get("ok"):
+            print(f"publish-linkedin: {result.get('reason')}", file=sys.stderr)
+            return 1
+        clip = f" · copied via {result['clipboard']}" if result.get("clipboard") else " · no clipboard tool found"
+        print(f"linkedin draft {result['draft_id'][:8]} marked sent{clip}. share URL: {result['share_url']}")
+        print(f"body: {result['body_preview']}...")
+        return 0
+
     if args.command == "policy":
         from .policy import load_policy, save_policy
         if args.policy_cmd == "show":
@@ -740,6 +771,12 @@ def _dispatch(args, con) -> int:
         if args.quiet_hours is not None:
             parts = [int(x) for x in args.quiet_hours.split(",")]
             policy.quiet_hours = (parts[0], parts[1])
+        if args.gmail_auto_reply is not None:
+            policy.gmail_auto_reply_enabled = args.gmail_auto_reply == "true"
+        if args.x_post is not None:
+            policy.x_post_enabled = args.x_post == "true"
+        if args.x_reply is not None:
+            policy.x_reply_enabled = args.x_reply == "true"
         path = save_policy(policy, args.db)
         # Loud confirmation when arming real sends.
         if policy.level >= 1 and not policy.dry_run:

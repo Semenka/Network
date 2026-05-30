@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import shutil
 import sqlite3
 import urllib.parse
@@ -32,6 +33,7 @@ from ..db import (
     get_or_create_org,
     mark_draft_pushed,
     mark_draft_responded,
+    new_id,
     now_iso,
     upsert_person,
 )
@@ -59,6 +61,54 @@ GMAIL_SEND_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
 DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files/{id}"
 DRIVE_EXPORT_URL = "https://www.googleapis.com/drive/v3/files/{id}/export"
 USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
+
+
+# Patterns identifying machine-generated addresses we must never auto-reply to.
+# Matched against the local-part (before @) and full address (case-insensitive).
+_BOT_LOCAL_TOKENS = (
+    "noreply", "no-reply", "no_reply", "donotreply", "do-not-reply", "dontreply",
+    "mailer-daemon", "postmaster", "bounce", "bounces",
+    "notification", "notifications", "notify", "notif", "alert", "alerts",
+    "newsletter", "marketing", "promo", "promotions", "campaign", "campaigns",
+    "support", "help", "service", "billing", "invoice", "receipts", "payments",
+    "info", "hello", "contact", "team", "robot", "automation", "automated",
+    "booking", "reservation", "security", "abuse", "trading", "tradingassistant",
+    "auto", "system", "noticias", "updates", "news",
+    "email", "emails", "mail",  # generic newsletter aliases
+    "welcome", "bienvenue", "willkommen", "benvenuto", "bienvenido",  # onboarding aliases
+    "digest", "weekly", "daily",  # newsletter cadence aliases
+    # very long hash-suffixed reply aliases like reply-abcdef0123...@reply-sg.x.com
+)
+_BOT_LOCAL_RE = re.compile(r"(?:^|[._-])(" + "|".join(_BOT_LOCAL_TOKENS) + r")(?:$|[._-])", re.I)
+# Long alphanumeric-hash local part with no vowels alongside (sendgrid relays).
+_HASH_LOCAL_RE = re.compile(r"^[a-z]+-[a-f0-9]{16,}$", re.I)
+# Sub-mailer domains used to send notifications (mail.instagram.com, notif.x.fr,
+# reply-sg.example.com, a.store.x.com, marketing.x.com, em.x.com).
+_BOT_DOMAIN_RE = re.compile(
+    r"(?:^|\.)(mail|mailing|notif|notifications|alerts|news|updates|broadcast|bounces?"
+    r"|reply|reply-sg|sg-reply|em|em\d*|sendgrid|mktomail|marketing|promo|store"
+    r"|order|orders|invoice|invoices|noreply|news\.\w+|tracking)\.",
+    re.I,
+)
+
+
+def _is_bot_address(email: str | None, owner_emails: set[str]) -> bool:
+    """Return True if this address looks machine-generated or is one of ours."""
+    if not email:
+        return True
+    em = email.strip().lower()
+    if em in owner_emails:
+        return True
+    if "@" not in em:
+        return True
+    local, _, domain = em.partition("@")
+    if _BOT_LOCAL_RE.search(local):
+        return True
+    if _HASH_LOCAL_RE.search(local):
+        return True
+    if _BOT_DOMAIN_RE.search(domain):
+        return True
+    return False
 
 
 def _flow(client_id: str, client_secret: str, *, port: int, scopes: str = DEFAULT_SCOPES) -> OAuthFlow:
@@ -776,6 +826,169 @@ def download_drive_file(
         "mime_type": mime,
         "size_bytes": dest_path.stat().st_size,
         "path": str(dest_path),
+    }
+
+
+def auto_reply_to_gmail(
+    con: sqlite3.Connection,
+    *,
+    policy,
+    lookback_days: int = 3,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Auto-acknowledge fresh incoming Gmail from known contacts we haven't replied to.
+
+    Targets only contacts with ``consent_status='active'``, an existing
+    relationship history, no outgoing reply on the thread since the inbound
+    message, and inbound within the last ``lookback_days``. Drafts a short
+    acknowledgement (channel='gmail', status='approved'), threads it
+    correctly via ``In-Reply-To``/``References`` headers, then sends per
+    ``policy``. Off by default — requires ``policy.gmail_auto_reply_enabled``.
+    """
+    from ..policy import permits_send  # local import — avoid cycle at load
+    if not getattr(policy, "gmail_auto_reply_enabled", False):
+        return {"considered": 0, "drafted": 0, "sent": 0, "skipped": "policy.gmail_auto_reply_enabled is false"}
+
+    record = _ensure_token(con)
+    scopes = (record.get("scopes") or "").split()
+    if SCOPE_GMAIL_SEND not in scopes and "https://www.googleapis.com/auth/gmail.modify" not in scopes:
+        raise AuthRequired("Saved Google token lacks gmail.send; re-run auth-google --manual.")
+    headers = {**_authed_headers(record), "Content-Type": "application/json"}
+    sender = record.get("account") or None
+
+    owner_emails = {(record.get("account") or "").lower()}
+    extra = os.environ.get("NETWORK_CHIEF_SELF_EMAILS", "")
+    owner_emails.update(e.strip().lower() for e in extra.split(",") if e.strip())
+
+    raw_candidates = con.execute(
+        """
+        SELECT i.id AS interaction_id, i.source_ref AS message_id, i.subject, i.body_summary, i.occurred_at,
+               p.id AS person_id, p.full_name, p.primary_email, p.consent_status
+          FROM interactions i
+          JOIN people p ON p.id = i.person_id
+         WHERE i.channel = 'gmail'
+           AND i.direction = 'incoming'
+           AND COALESCE(p.consent_status, 'active') = 'active'
+           AND p.primary_email IS NOT NULL AND p.primary_email != ''
+           AND i.occurred_at >= datetime('now', ?)
+           AND NOT EXISTS (
+               SELECT 1 FROM interactions o
+                WHERE o.person_id = i.person_id
+                  AND o.channel = 'gmail'
+                  AND o.direction = 'outgoing'
+                  AND o.occurred_at > i.occurred_at
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM drafts d
+                WHERE d.person_id = i.person_id
+                  AND d.channel = 'gmail'
+                  AND d.rationale = 'auto-ack'
+                  AND d.created_at >= datetime('now', '-3 days')
+           )
+         ORDER BY i.occurred_at DESC
+         LIMIT ?
+        """,
+        (f"-{int(lookback_days)} days", int(limit) * 4),  # over-fetch; we filter below
+    ).fetchall()
+
+    candidates = [r for r in raw_candidates
+                  if not _is_bot_address(r["primary_email"], owner_emails)][:int(limit)]
+
+    considered = drafted = sent_count = 0
+    # Count today's sends for the daily cap (counts only real sends, not dry_run).
+    todays_sends = con.execute(
+        "SELECT count(*) FROM drafts WHERE sent_at >= strftime('%Y-%m-%dT00:00:00Z','now')"
+    ).fetchone()[0]
+
+    blocked: list[str] = []
+    results: list[dict[str, str]] = []
+
+    for cand in candidates:
+        considered += 1
+        first_name = (cand["full_name"] or "there").split()[0]
+        subject_in = (cand["subject"] or "").strip()
+        reply_subject = subject_in if subject_in.lower().startswith("re:") else f"Re: {subject_in or '(no subject)'}"
+        body = (
+            f"Hi {first_name},\n\n"
+            "Quick acknowledgement — I have your note and will reply with a real "
+            "answer within the next couple of days.\n\n"
+            "Best,\n"
+            "Andrey"
+        )
+
+        # Look up the thread id from the most recent draft we pushed to this
+        # contact, or leave None (Gmail will create a new thread).
+        thread_row = con.execute(
+            "SELECT gmail_thread_id FROM drafts WHERE person_id = ? AND gmail_thread_id IS NOT NULL "
+            "ORDER BY created_at DESC LIMIT 1",
+            (cand["person_id"],),
+        ).fetchone()
+        thread_id = thread_row[0] if thread_row else None
+
+        draft_id = new_id()
+        ts = now_iso()
+        con.execute(
+            """
+            INSERT INTO drafts (id, person_id, channel, subject, body, rationale,
+                                status, outcome, gmail_thread_id, created_at, updated_at)
+            VALUES (?, ?, 'gmail', ?, ?, 'auto-ack', 'approved', 'pending', ?, ?, ?)
+            """,
+            (draft_id, cand["person_id"], reply_subject, body, thread_id, ts, ts),
+        )
+        con.commit()
+        drafted += 1
+
+        draft_for_gate = {
+            "id": draft_id,
+            "person_id": cand["person_id"],
+            "primary_email": cand["primary_email"],
+            "consent_status": cand["consent_status"],
+        }
+        allowed, reason = permits_send(
+            policy, con, draft_for_gate, todays_sends=todays_sends + sent_count, channel="gmail"
+        )
+        if not allowed:
+            blocked.append(f"{cand['full_name']}: {reason}")
+            continue
+
+        if policy.dry_run:
+            results.append({"draft_id": draft_id, "to": cand["primary_email"], "name": cand["full_name"], "mode": "dry_run"})
+            continue
+
+        try:
+            raw = _build_rfc2822(
+                sender=sender,
+                to=cand["primary_email"],
+                subject=reply_subject,
+                body=body,
+            )
+            payload: dict[str, Any] = {"raw": raw}
+            if thread_id:
+                payload["threadId"] = thread_id
+            resp = request_json("POST", GMAIL_SEND_URL, headers=headers, json_body=payload)
+            con.execute(
+                """
+                UPDATE drafts SET status='sent', sent_at=?,
+                                  gmail_message_id=COALESCE(?, gmail_message_id),
+                                  gmail_thread_id=COALESCE(gmail_thread_id, ?),
+                                  updated_at=?
+                 WHERE id=?
+                """,
+                (now_iso(), resp.get("id"), resp.get("threadId"), now_iso(), draft_id),
+            )
+            con.commit()
+            sent_count += 1
+            results.append({"draft_id": draft_id, "to": cand["primary_email"], "name": cand["full_name"], "mode": "sent"})
+        except Exception as exc:  # pragma: no cover
+            blocked.append(f"{cand['full_name']}: send error: {exc}")
+
+    return {
+        "considered": considered,
+        "drafted": drafted,
+        "sent": sent_count,
+        "blocked": len(blocked),
+        "items": results,
+        "block_reasons": blocked[:10],
     }
 
 

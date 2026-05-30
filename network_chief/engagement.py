@@ -223,3 +223,89 @@ def prepare_x_comments(con: sqlite3.Connection, *, topic: str | None = None, cou
             )
         )
     return draft_ids
+
+
+def publish_linkedin_assist(
+    con: sqlite3.Connection,
+    *,
+    draft_id: str | None = None,
+    open_browser: bool = True,
+    out_file: str | None = None,
+) -> dict[str, Any]:
+    """One-tap LinkedIn publishing helper.
+
+    LinkedIn has no public Posts API for personal apps, so the closest
+    real automation is: pick the next approved ``linkedin_post`` draft,
+    copy its body to the system clipboard, open LinkedIn's share dialog
+    in the browser, and (on success) mark the draft ``status='sent'`` so
+    the loop knows it's published.
+
+    Tries ``pbcopy`` (macOS), ``xclip``/``wl-copy`` (Linux), then falls
+    back to writing the body to ``out_file`` so the user can copy it
+    manually.
+    """
+    import shutil
+    import subprocess
+    import webbrowser
+
+    if draft_id:
+        row = con.execute(
+            "SELECT id, body, status FROM drafts WHERE id = ? AND channel = 'linkedin_post'",
+            (draft_id,),
+        ).fetchone()
+    else:
+        row = con.execute(
+            "SELECT id, body, status FROM drafts WHERE channel='linkedin_post' AND status='approved' "
+            "ORDER BY created_at LIMIT 1"
+        ).fetchone()
+        if row is None:
+            row = con.execute(
+                "SELECT id, body, status FROM drafts WHERE channel='linkedin_post' AND status='draft' "
+                "ORDER BY created_at LIMIT 1"
+            ).fetchone()
+    if row is None:
+        return {"ok": False, "reason": "no linkedin_post draft found"}
+
+    body = row["body"] or ""
+    copied_via = None
+    for tool, cmd in (("pbcopy", ["pbcopy"]), ("xclip", ["xclip", "-selection", "clipboard"]),
+                      ("wl-copy", ["wl-copy"])):
+        if shutil.which(tool):
+            try:
+                subprocess.run(cmd, input=body.encode("utf-8"), check=True)
+                copied_via = tool
+                break
+            except Exception:
+                continue
+
+    if out_file:
+        from pathlib import Path
+        p = Path(out_file)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body, encoding="utf-8")
+
+    share_url = "https://www.linkedin.com/feed/?shareActive=true"
+    if open_browser:
+        try:
+            webbrowser.open(share_url, new=1, autoraise=True)
+        except Exception:
+            pass
+
+    # Mark as sent in the local pipeline (user is about to paste+post).
+    from .db import now_iso
+    ts = now_iso()
+    con.execute(
+        "UPDATE drafts SET status='sent', sent_at=?, updated_at=? WHERE id=?",
+        (ts, ts, row["id"]),
+    )
+    con.commit()
+
+    return {
+        "ok": True,
+        "draft_id": row["id"],
+        "previous_status": row["status"],
+        "clipboard": copied_via,
+        "out_file": out_file,
+        "share_url": share_url,
+        "body_preview": body[:120],
+    }
