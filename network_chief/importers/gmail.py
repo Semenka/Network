@@ -3,41 +3,14 @@ from __future__ import annotations
 import json
 import mailbox
 import sqlite3
-from datetime import UTC, datetime
 from email.message import Message
-from email.utils import getaddresses, parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
 from ..db import add_connection_value, add_interaction, add_source_fact, upsert_person
 from ..scoring import infer_connection_values_from_text
-
-
-def _parse_date(value: str | None) -> str | None:
-    if not value:
-        return None
-    try:
-        parsed = parsedate_to_datetime(value)
-    except (TypeError, ValueError):
-        try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            return value
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def _addresses(value: str | None) -> list[tuple[str, str]]:
-    if not value:
-        return []
-    parsed = []
-    for name, address in getaddresses([value]):
-        address = address.strip().lower()
-        if not address:
-            continue
-        parsed.append((name.strip() or address.split("@")[0], address))
-    return parsed
+from ._addresses import parse_addresses as _addresses
+from ._addresses import parse_date as _parse_date
 
 
 def _body_preview(message: Message, limit: int = 500) -> str | None:

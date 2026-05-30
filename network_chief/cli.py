@@ -1,16 +1,60 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sys
 from pathlib import Path
 
+from .auth.errors import AuthRequired, OAuthError, RateLimited
+from .auth.tokens import TokenStore
 from .brief import build_daily_brief, mindmap_json
-from .db import connect, create_goal, init_db, list_connection_values, list_goals, record_source_run
+from .cleanup import delete_people, find_misclassified, merge_people
+from .dashboard import compute_dashboard, previous_snapshot, render_markdown, save_snapshot
+from .review import compute_review, previous_review, render_review_markdown, save_review
+from .db import (
+    add_goal_milestone,
+    connect,
+    create_goal,
+    db_path_from_env,
+    init_db,
+    list_connection_values,
+    list_goals,
+    record_source_run,
+    set_consent_status,
+    update_goal_milestone,
+)
+from .graph import render_graph_markdown
 from .drafts import list_drafts, set_draft_status
-from .engagement import prepare_gmail_keepalive, prepare_linkedin_posts, prepare_x_comments, prepare_x_posts
+from .discovery import discover_telegram_handles, import_telegram_csv, set_telegram_handle
+from .engagement import (
+    prepare_gmail_keepalive,
+    prepare_linkedin_posts,
+    prepare_telegram_keepalive,
+    prepare_x_comments,
+    prepare_x_posts,
+    publish_linkedin_assist,
+    render_telegram_links,
+)
 from .importers.gmail import import_gmail_json, import_gmail_mbox
+from .importers.google_api import (
+    auth_google,
+    detect_replies_heuristic,
+    download_drive_file,
+    push_drafts_to_gmail,
+    revoke_google,
+    sync_gmail_messages,
+    sync_google_contacts,
+)
 from .importers.linkedin import import_connections, import_linkedin_interactions
+from .importers.linkedin_api import (
+    LinkedInDMARequired,
+    auth_linkedin_owner,
+    guided_linkedin_export,
+    sync_linkedin_dma,
+)
 from .importers.x import import_x_export
+from .importers.x_api import auth_x, revoke_x, sync_x_following, sync_x_mentions
 from .value import maintain_connection_values
 
 
@@ -30,9 +74,26 @@ def _write_or_print(content: str, out: str | None) -> None:
         print(content)
 
 
+def _parse_interval(text: str) -> int:
+    """Parse '30m' / '6h' / '1d' / '900' (seconds) into seconds."""
+    text = (text or "").strip().lower()
+    if not text:
+        return 21600
+    unit = text[-1]
+    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}.get(unit)
+    if mult is None:
+        return int(text)  # bare seconds
+    return int(float(text[:-1]) * mult)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="network-chief", description="Local-first chief-of-network agent.")
     parser.add_argument("--db", help="SQLite database path. Defaults to NETWORK_CHIEF_DB or data/network.db.")
+    parser.add_argument(
+        "--no-dashboard",
+        action="store_true",
+        help="Skip auto-refreshing dashboards/dashboard-30d.md after state-changing commands.",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init", help="Initialize the local database.")
@@ -122,17 +183,298 @@ def build_parser() -> argparse.ArgumentParser:
 
     reject = sub.add_parser("reject-draft", help="Mark a draft as rejected.")
     reject.add_argument("--id", required=True)
+    reject.add_argument(
+        "--reason",
+        help="Why rejected (feeds the review rejection-pattern rule). "
+        "Suggested: wrong_timing | weak_context | wrong_channel | too_transactional | duplicate | not_relevant.",
+    )
+
+    add_ms = sub.add_parser("add-milestone", help="Add a measurable milestone to a goal.")
+    add_ms.add_argument("--goal-id", required=True)
+    add_ms.add_argument("--metric", required=True, help="Metric name, e.g. 'warm investor conversations'.")
+    add_ms.add_argument("--target", type=float, default=1.0)
+    add_ms.add_argument("--current", type=float, default=0.0)
+
+    upd_ms = sub.add_parser("update-milestone", help="Update a goal milestone's current value.")
+    upd_ms.add_argument("--id", required=True)
+    upd_ms.add_argument("--current", type=float, required=True)
 
     mindmap = sub.add_parser("mindmap", help="Export graph-style mind map JSON.")
     mindmap.add_argument("--out", help="Write JSON to a file.")
 
+    # --- OAuth: auth + sync ----------------------------------------------------
+    auth_g = sub.add_parser("auth-google", help="Authorize Google (Gmail + People API). Browser-based.")
+    auth_g.add_argument("--client-id")
+    auth_g.add_argument("--client-secret")
+    auth_g.add_argument("--scopes")
+    auth_g.add_argument("--no-browser", action="store_true", help="Print URL only, don't open a browser.")
+    auth_g.add_argument("--manual", action="store_true", help="Skip the loopback server. Prints URL; finish with --redirect-url.")
+    auth_g.add_argument("--redirect-url", help="Paste the full URL your browser was redirected to (after a --manual start).")
+
+    auth_x_p = sub.add_parser("auth-x", help="Authorize X.com (OAuth 2.0 PKCE). Browser-based.")
+    auth_x_p.add_argument("--client-id")
+    auth_x_p.add_argument("--client-secret")
+    auth_x_p.add_argument("--scopes")
+    auth_x_p.add_argument("--no-browser", action="store_true")
+    auth_x_p.add_argument("--manual", action="store_true")
+    auth_x_p.add_argument("--redirect-url")
+
+    auth_li = sub.add_parser("auth-linkedin", help="Authorize LinkedIn (OIDC owner identity).")
+    auth_li.add_argument("--client-id")
+    auth_li.add_argument("--client-secret")
+    auth_li.add_argument("--no-browser", action="store_true")
+    auth_li.add_argument("--manual", action="store_true")
+    auth_li.add_argument("--redirect-url")
+
+    sub.add_parser("auth-status", help="List stored OAuth tokens (no secrets shown).")
+
+    auth_revoke = sub.add_parser("auth-revoke", help="Revoke and delete an OAuth token.")
+    auth_revoke.add_argument("--provider", required=True, choices=["google", "x", "linkedin"])
+    auth_revoke.add_argument("--account")
+
+    sync_g = sub.add_parser("sync-google", help="Pull Google People connections + recent Gmail metadata.")
+    sync_g.add_argument("--limit", type=int)
+    sync_g.add_argument("--since", help="ISO date or unix seconds; only used for Gmail.")
+    sync_g.add_argument("--skip-people", action="store_true")
+    sync_g.add_argument("--skip-gmail", action="store_true")
+    sync_g.add_argument(
+        "--heuristic",
+        action="store_true",
+        help="Also mark pending drafts (sent outside this tool) as responded when the recipient emailed back.",
+    )
+
+    sync_x_p = sub.add_parser("sync-x", help="Pull X.com following list + recent mentions.")
+    sync_x_p.add_argument("--limit", type=int)
+    sync_x_p.add_argument("--since", help="ISO 8601 start_time for mentions.")
+    sync_x_p.add_argument("--max-pages", type=int, help="Cap on paginated requests per endpoint.")
+    sync_x_p.add_argument("--skip-following", action="store_true")
+    sync_x_p.add_argument("--skip-mentions", action="store_true")
+
+    sync_li = sub.add_parser("sync-linkedin", help="Capture LinkedIn owner identity; optionally walk you through a CSV export.")
+    sync_li.add_argument("--guided-export", action="store_true", help="Open data-download page and watch exports/ for the archive.")
+    sync_li.add_argument("--watch-dir", default="exports")
+    sync_li.add_argument("--timeout", type=int, default=900)
+    sync_li.add_argument("--no-browser", action="store_true")
+
+    review = sub.add_parser(
+        "agent-review",
+        help="Weekly retrospective of agent activity + ranked efficiency recommendations (read-only).",
+    )
+    review.add_argument("--window", type=int, default=7)
+    review.add_argument("--out", help="Write markdown to a file.")
+    review.add_argument("--json", dest="json_out", help="Also write the raw JSON review to this path.")
+    review.add_argument("--no-snapshot", action="store_true", help="Render only; do not persist a review_snapshots row.")
+
+    dash = sub.add_parser("dashboard", help="Render performance dashboard with deltas vs previous snapshot.")
+    dash.add_argument("--window", type=int, default=30, help="Time window in days (default 30).")
+    dash.add_argument("--out", help="Write markdown to a file.")
+    dash.add_argument("--json", dest="json_out", help="Also write the raw JSON snapshot to this path.")
+    dash.add_argument("--no-snapshot", action="store_true", help="Render only; do not persist a kpi_snapshots row.")
+    dash.add_argument("--graph-limit", type=int, default=40, help="Top-N people in the embedded Mermaid graph.")
+
+    graph = sub.add_parser("graph", help="Render the top-N network as a Mermaid graph (renders inline on GitHub).")
+    graph.add_argument("--limit", type=int, default=40)
+    graph.add_argument("--out", help="Write the Mermaid markdown to a file.")
+
+    cleanup = sub.add_parser(
+        "cleanup-people",
+        help="Find (and optionally delete) person rows whose full_name is an email, domain, or org name.",
+    )
+    cleanup.add_argument("--delete", action="store_true", help="Actually delete; default is dry-run.")
+    cleanup.add_argument("--limit", type=int, help="Only show/delete the first N candidates.")
+
+    merge = sub.add_parser(
+        "merge-people",
+        help="Merge duplicate person rows into one, re-pointing all their history.",
+    )
+    merge.add_argument("--into", required=True, help="Primary person id to keep.")
+    merge.add_argument("--from", dest="from_ids", required=True, help="Comma-separated duplicate person id(s) to merge in.")
+
+    consent = sub.add_parser(
+        "set-consent",
+        help="Set a contact's consent status; non-active contacts are excluded from ranking and outreach.",
+    )
+    consent.add_argument("--status", required=True, choices=["active", "paused", "opted_out"])
+    consent_group = consent.add_mutually_exclusive_group(required=True)
+    consent_group.add_argument("--id")
+    consent_group.add_argument("--email")
+    consent_group.add_argument("--linkedin-url")
+    consent_group.add_argument("--name")
+
+    push = sub.add_parser(
+        "push-drafts",
+        help="Push pending network-chief drafts into the user's Gmail Drafts (read-and-write Google scope required).",
+    )
+    push.add_argument("--limit", type=int, help="Cap on how many drafts to push.")
+    push.add_argument("--status", default="draft", help="Local draft status to filter on (default: draft).")
+
+    disc_tg = sub.add_parser(
+        "discover-telegram",
+        help="Scan all per-person text for Telegram handles (t.me/<h>, tg:<h>); update people.telegram_handle where empty.",
+    )
+
+    set_tg = sub.add_parser(
+        "set-telegram",
+        help="Manually set the telegram_handle for a single person (look up by id, email, linkedin_url, or full_name).",
+    )
+    set_tg.add_argument("--handle", required=True, help="Telegram handle (with or without leading @, or full t.me/<h>).")
+    set_tg_group = set_tg.add_mutually_exclusive_group(required=True)
+    set_tg_group.add_argument("--id")
+    set_tg_group.add_argument("--email")
+    set_tg_group.add_argument("--linkedin-url")
+    set_tg_group.add_argument("--name")
+
+    bulk_tg = sub.add_parser(
+        "import-telegram",
+        help="Bulk import telegram handles from a CSV (columns: <lookup>, handle).",
+    )
+    bulk_tg.add_argument("--file", required=True)
+    bulk_tg.add_argument("--lookup", choices=["email", "linkedin_url", "full_name"], default="email")
+
+    tg_keep = sub.add_parser(
+        "prepare-telegram-keepalive",
+        help="Create Telegram drafts for stale, high-value contacts who have a telegram handle.",
+    )
+    tg_keep.add_argument("--limit", type=int, default=10)
+
+    tg_links = sub.add_parser(
+        "telegram-links",
+        help="Render pending Telegram drafts as clickable t.me deep-links (no bot needed).",
+    )
+    tg_links.add_argument("--limit", type=int, help="Cap on how many drafts to render.")
+    tg_links.add_argument("--out", help="Write the markdown to a file (default stdout).")
+    tg_links.add_argument("--status", default="draft")
+
+    drv = sub.add_parser(
+        "import-drive",
+        help="Download a Google Drive file via the saved Google token and ingest it.",
+    )
+    drv.add_argument("--file-id", required=True, help="Google Drive file id (the long string in the share URL).")
+    drv.add_argument("--out", help="Where to save the downloaded file (default exports/<name>).")
+    drv.add_argument(
+        "--treat-as",
+        choices=["linkedin", "linkedin-interactions", "gmail-json", "x", "none"],
+        default="linkedin",
+        help="Which importer to run after download. 'none' just downloads.",
+    )
+    drv.add_argument("--owner", help="Mailbox owner / LinkedIn handle / X handle, passed through to the importer.")
+    drv.add_argument("--limit", type=int, help="Optional row limit for the chosen importer.")
+
+    li_pub = sub.add_parser(
+        "publish-linkedin",
+        help="One-tap LinkedIn publish helper: copies an approved post to clipboard and opens LinkedIn's share dialog.",
+    )
+    li_pub.add_argument("--id", help="Specific linkedin_post draft id (defaults to next approved).")
+    li_pub.add_argument("--no-browser", action="store_true")
+    li_pub.add_argument("--out", help="Also write the body to this file.")
+
+    auto = sub.add_parser(
+        "autopilot",
+        help="Run the autonomous SENSE->THINK->ACT->REPORT cycle once (or loop). Outbound gated by policy.",
+    )
+    auto.add_argument("--once", action="store_true", default=True, help="Run a single cycle and exit (default).")
+    auto.add_argument("--loop", action="store_true", help="Run forever, sleeping --interval between cycles.")
+    auto.add_argument("--interval", default="6h", help="Loop interval, e.g. 30m, 6h, 1d (used with --loop).")
+    auto.add_argument("--dry-run", action="store_true", help="Force policy.dry_run for this run (no sends).")
+    auto.add_argument("--level", type=int, choices=[0, 1, 2], help="Override autonomy level for this run only.")
+
+    pol = sub.add_parser("policy", help="Show or set the autonomy policy that gates autonomous sending.")
+    pol_sub = pol.add_subparsers(dest="policy_cmd", required=True)
+    pol_sub.add_parser("show", help="Print the current autonomy policy as JSON.")
+    pol_set = pol_sub.add_parser("set", help="Update autonomy policy fields.")
+    pol_set.add_argument("--level", type=int, choices=[0, 1, 2])
+    pol_set.add_argument("--dry-run", dest="dry_run", choices=["true", "false"])
+    pol_set.add_argument("--daily-send-cap", type=int)
+    pol_set.add_argument("--min-days-between-touches", type=int)
+    pol_set.add_argument("--require-prior-reply", choices=["true", "false"])
+    pol_set.add_argument("--require-existing-contact", choices=["true", "false"])
+    pol_set.add_argument("--channels", help="Comma-separated channels enabled for sending, e.g. gmail,x.")
+    pol_set.add_argument("--quiet-hours", help="START,END local hours with no sends, e.g. 21,8.")
+    pol_set.add_argument("--gmail-auto-reply", dest="gmail_auto_reply", choices=["true", "false"],
+                         help="Enable auto-acknowledge for incoming Gmail from known contacts.")
+    pol_set.add_argument("--x-post", dest="x_post", choices=["true", "false"],
+                         help="Enable auto-publishing of approved x_post drafts.")
+    pol_set.add_argument("--x-reply", dest="x_reply", choices=["true", "false"],
+                         help="Enable auto-replying to recent X mentions.")
+
     return parser
+
+
+_STATE_CHANGING_COMMANDS = frozenset(
+    {
+        "import-linkedin",
+        "import-linkedin-interactions",
+        "import-gmail-json",
+        "import-gmail-mbox",
+        "import-x",
+        "import-drive",
+        "sync-google",
+        "sync-x",
+        "sync-linkedin",
+        "maintain-values",
+        "brief",
+        "prepare-gmail-keepalive",
+        "prepare-linkedin-posts",
+        "prepare-x-posts",
+        "prepare-x-comments",
+        "approve-draft",
+        "reject-draft",
+        "add-goal",
+        "add-milestone",
+        "update-milestone",
+        "cleanup-people",
+        "merge-people",
+        "set-consent",
+        "push-drafts",
+        "discover-telegram",
+        "set-telegram",
+        "import-telegram",
+        "prepare-telegram-keepalive",
+        "publish-linkedin",
+    }
+)
+
+
+def _maybe_auto_refresh(args, con, db_path: str) -> None:
+    """After a successful state-changing command, refresh dashboards/dashboard-30d.md.
+
+    Skipped for read-only / OAuth / dashboard commands, in-memory test DBs,
+    when --no-dashboard was passed, or when NETWORK_CHIEF_NO_DASHBOARD=1 in env.
+    """
+    if getattr(args, "no_dashboard", False):
+        return
+    if os.environ.get("NETWORK_CHIEF_NO_DASHBOARD") == "1":
+        return
+    if db_path == ":memory:":
+        return
+    if args.command not in _STATE_CHANGING_COMMANDS:
+        return
+    try:
+        snapshot = compute_dashboard(con, window_days=30)
+        prev = previous_snapshot(con, window_days=30)
+        save_snapshot(con, snapshot)
+        markdown = render_markdown(snapshot, previous=prev, con=con)
+        out_dir = Path(os.environ.get("NETWORK_CHIEF_DASHBOARDS_DIR", "dashboards"))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "dashboard-30d.md").write_text(markdown, encoding="utf-8")
+        (out_dir / "dashboard-30d.json").write_text(
+            json.dumps(snapshot, indent=2, sort_keys=True), encoding="utf-8"
+        )
+    except Exception as exc:  # pragma: no cover - best-effort hook, never break the parent command
+        print(f"[dashboard] auto-refresh failed: {exc}", file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    db_path = db_path_from_env(args.db)
     con = _connection(args.db)
+    rc = _dispatch(args, con)
+    if rc == 0:
+        _maybe_auto_refresh(args, con, db_path)
+    return rc
 
+
+def _dispatch(args, con) -> int:
     if args.command == "init":
         print("Initialized Network Chief database.")
         return 0
@@ -237,14 +579,429 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "reject-draft":
-        if not set_draft_status(con, args.id, "rejected"):
+        if not set_draft_status(con, args.id, "rejected", reason=args.reason):
             print(f"Draft not found: {args.id}", file=sys.stderr)
             return 1
-        print(f"Rejected draft {args.id}")
+        print(f"Rejected draft {args.id}" + (f" (reason: {args.reason})" if args.reason else ""))
+        return 0
+
+    if args.command == "add-milestone":
+        milestone_id = add_goal_milestone(
+            con,
+            goal_id=args.goal_id,
+            metric_name=args.metric,
+            target_value=args.target,
+            current_value=args.current,
+        )
+        print(milestone_id)
+        return 0
+
+    if args.command == "update-milestone":
+        if not update_goal_milestone(con, args.id, current_value=args.current):
+            print(f"Milestone not found: {args.id}", file=sys.stderr)
+            return 1
+        print(f"Updated milestone {args.id} → {args.current:g}")
         return 0
 
     if args.command == "mindmap":
         _write_or_print(mindmap_json(con), args.out)
+        return 0
+
+    if args.command == "auth-google":
+        try:
+            result = auth_google(
+                con,
+                client_id=args.client_id,
+                client_secret=args.client_secret,
+                scopes=args.scopes,
+                open_browser=not args.no_browser,
+                manual=args.manual,
+                redirect_url=args.redirect_url,
+            )
+        except (AuthRequired, OAuthError) as exc:
+            print(f"auth-google failed: {exc}", file=sys.stderr)
+            return 2
+        if result.get("manual_step") == "open_url":
+            print(f"[google] Open this URL in your browser, then paste the resulting redirect URL:")
+            print(result["authorize_url"])
+            print(f"[google] Finish with: network-chief auth-google --redirect-url '<paste here>'")
+            return 0
+        print(f"google authorized: {result['account']} (scopes={result.get('scopes', '')})")
+        return 0
+
+    if args.command == "auth-x":
+        try:
+            result = auth_x(
+                con,
+                client_id=args.client_id,
+                client_secret=args.client_secret,
+                scopes=args.scopes,
+                open_browser=not args.no_browser,
+                manual=args.manual,
+                redirect_url=args.redirect_url,
+            )
+        except (AuthRequired, OAuthError) as exc:
+            print(f"auth-x failed: {exc}", file=sys.stderr)
+            return 2
+        if result.get("manual_step") == "open_url":
+            print(f"[x] Open this URL in your browser, then paste the resulting redirect URL:")
+            print(result["authorize_url"])
+            print(f"[x] Finish with: network-chief auth-x --redirect-url '<paste here>'")
+            return 0
+        print(f"x authorized: @{result['account']} (user_id={result.get('user_id')})")
+        return 0
+
+    if args.command == "auth-linkedin":
+        try:
+            result = auth_linkedin_owner(
+                con,
+                client_id=args.client_id,
+                client_secret=args.client_secret,
+                open_browser=not args.no_browser,
+                manual=args.manual,
+                redirect_url=args.redirect_url,
+            )
+        except (AuthRequired, OAuthError) as exc:
+            print(f"auth-linkedin failed: {exc}", file=sys.stderr)
+            return 2
+        if result.get("manual_step") == "open_url":
+            print(f"[linkedin] Open this URL in your browser, then paste the resulting redirect URL:")
+            print(result["authorize_url"])
+            print(f"[linkedin] Finish with: network-chief auth-linkedin --redirect-url '<paste here>'")
+            return 0
+        print(f"linkedin authorized: {result['account']} ({result.get('name')})")
+        return 0
+
+    if args.command == "auth-status":
+        rows = TokenStore(con).list()
+        if not rows:
+            print("no oauth tokens stored. run: network-chief auth-google | auth-x | auth-linkedin")
+            return 0
+        for row in rows:
+            print(
+                f"{row['provider']:9s} | {row['account']:32s} | scopes={row['scopes']} | "
+                f"expires_at={row['expires_at'] or '-'} | refreshable={'yes' if row.get('refresh_token') else 'no'}"
+            )
+        return 0
+
+    if args.command == "auth-revoke":
+        revoker = {"google": revoke_google, "x": revoke_x}.get(args.provider)
+        if revoker is not None:
+            removed = revoker(con, account=args.account)
+        else:
+            removed = TokenStore(con).delete(args.provider, args.account)
+        print(f"removed {removed} token(s) for provider={args.provider}")
+        return 0
+
+    if args.command == "sync-google":
+        combined: dict[str, int] = {}
+        try:
+            if not args.skip_people:
+                stats = sync_google_contacts(con, limit=args.limit)
+                record_source_run(con, source="google_people", source_ref=None, status=stats.get("status", "ok"), stats=stats)
+                combined["people"] = stats
+                print(f"google people: {stats}")
+            if not args.skip_gmail:
+                stats = sync_gmail_messages(con, since=args.since, limit=args.limit)
+                record_source_run(con, source="gmail_api", source_ref=None, status=stats.get("status", "ok"), stats=stats)
+                combined["gmail"] = stats
+                print(f"gmail messages: {stats}")
+            if args.heuristic:
+                h = detect_replies_heuristic(con)
+                print(f"heuristic reply detection: {h}")
+        except AuthRequired as exc:
+            print(f"sync-google: {exc}", file=sys.stderr)
+            return 2
+        return 0
+
+    if args.command == "sync-x":
+        try:
+            if not args.skip_following:
+                stats = sync_x_following(con, limit=args.limit, max_pages=args.max_pages)
+                record_source_run(con, source="x_api_following", source_ref=None, status=stats.get("status", "ok"), stats=stats)
+                print(f"x following: {stats}")
+            if not args.skip_mentions:
+                stats = sync_x_mentions(con, since=args.since, limit=args.limit, max_pages=args.max_pages)
+                record_source_run(con, source="x_api_mentions", source_ref=None, status=stats.get("status", "ok"), stats=stats)
+                print(f"x mentions: {stats}")
+        except AuthRequired as exc:
+            print(f"sync-x: {exc}", file=sys.stderr)
+            return 2
+        except RateLimited as exc:
+            print(f"sync-x rate-limited (reset_at={exc.reset_at}): {exc}", file=sys.stderr)
+            return 0
+        return 0
+
+    if args.command == "publish-linkedin":
+        result = publish_linkedin_assist(
+            con,
+            draft_id=args.id,
+            open_browser=not args.no_browser,
+            out_file=args.out,
+        )
+        if not result.get("ok"):
+            print(f"publish-linkedin: {result.get('reason')}", file=sys.stderr)
+            return 1
+        clip = f" · copied via {result['clipboard']}" if result.get("clipboard") else " · no clipboard tool found"
+        print(f"linkedin draft {result['draft_id'][:8]} marked sent{clip}. share URL: {result['share_url']}")
+        print(f"body: {result['body_preview']}...")
+        return 0
+
+    if args.command == "policy":
+        from .policy import load_policy, save_policy
+        if args.policy_cmd == "show":
+            print(json.dumps(load_policy(args.db).to_json(), indent=2, sort_keys=True))
+            return 0
+        # set
+        policy = load_policy(args.db)
+        if args.level is not None:
+            policy.level = args.level
+        if args.dry_run is not None:
+            policy.dry_run = args.dry_run == "true"
+        if args.daily_send_cap is not None:
+            policy.daily_send_cap = args.daily_send_cap
+        if args.min_days_between_touches is not None:
+            policy.min_days_between_touches = args.min_days_between_touches
+        if args.require_prior_reply is not None:
+            policy.require_prior_reply = args.require_prior_reply == "true"
+        if args.require_existing_contact is not None:
+            policy.require_existing_contact = args.require_existing_contact == "true"
+        if args.channels is not None:
+            policy.channels_enabled = tuple(c.strip() for c in args.channels.split(",") if c.strip())
+        if args.quiet_hours is not None:
+            parts = [int(x) for x in args.quiet_hours.split(",")]
+            policy.quiet_hours = (parts[0], parts[1])
+        if args.gmail_auto_reply is not None:
+            policy.gmail_auto_reply_enabled = args.gmail_auto_reply == "true"
+        if args.x_post is not None:
+            policy.x_post_enabled = args.x_post == "true"
+        if args.x_reply is not None:
+            policy.x_reply_enabled = args.x_reply == "true"
+        path = save_policy(policy, args.db)
+        # Loud confirmation when arming real sends.
+        if policy.level >= 1 and not policy.dry_run:
+            print(f"⚠ ARMED: autopilot will SEND at level {policy.level} (cap {policy.daily_send_cap}/day). Wrote {path}")
+        else:
+            print(f"Wrote {path} (level={policy.level}, dry_run={policy.dry_run})")
+        return 0
+
+    if args.command == "autopilot":
+        from .orchestrator import run_cycle
+        from .policy import load_policy
+        policy = load_policy(args.db)
+        if args.level is not None:
+            policy.level = args.level
+        if args.dry_run:
+            policy.dry_run = True
+
+        def _one() -> dict:
+            res = run_cycle(con, policy=policy)
+            steps = res.get("steps", [])
+            ok = sum(1 for s in steps if s["status"] == "ok")
+            skipped = sum(1 for s in steps if s["status"] == "skipped")
+            errored = sum(1 for s in steps if s["status"] == "error")
+            send = res.get("send") or {}
+            print(f"autopilot cycle: {ok} ok / {skipped} skipped / {errored} error · "
+                  f"sent={send.get('sent', 0)} dry={send.get('dry_run', 0)} blocked={send.get('blocked', 0)} · "
+                  f"auto-actions={len(res.get('auto_actions', []))}")
+            return res
+
+        if args.loop:
+            import time
+            seconds = _parse_interval(args.interval)
+            print(f"autopilot loop: every {args.interval} ({seconds}s). Ctrl-C to stop.")
+            try:
+                while True:
+                    _one()
+                    time.sleep(max(60, seconds))
+            except KeyboardInterrupt:
+                print("autopilot loop stopped.")
+            return 0
+        _one()
+        return 0
+
+    if args.command == "agent-review":
+        rev = compute_review(con, window_days=args.window)
+        prev = previous_review(con, window_days=args.window)
+        if not args.no_snapshot:
+            save_review(con, rev)
+        markdown = render_review_markdown(rev, previous=prev)
+        _write_or_print(markdown, args.out)
+        if args.json_out:
+            output = Path(args.json_out)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(rev, indent=2, sort_keys=True), encoding="utf-8")
+            print(f"Wrote {output}")
+        return 0
+
+    if args.command == "dashboard":
+        snapshot = compute_dashboard(con, window_days=args.window)
+        prev = previous_snapshot(con, window_days=args.window)
+        if not args.no_snapshot:
+            save_snapshot(con, snapshot)
+        markdown = render_markdown(snapshot, previous=prev, con=con, graph_limit=args.graph_limit)
+        _write_or_print(markdown, args.out)
+        if args.json_out:
+            output = Path(args.json_out)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(snapshot, indent=2, sort_keys=True), encoding="utf-8")
+            print(f"Wrote {output}")
+        return 0
+
+    if args.command == "graph":
+        markdown = render_graph_markdown(con, limit=args.limit)
+        _write_or_print(markdown, args.out)
+        return 0
+
+    if args.command == "discover-telegram":
+        stats = discover_telegram_handles(con)
+        record_source_run(
+            con,
+            source="telegram_discovery",
+            source_ref=None,
+            status="ok",
+            stats={k: v for k, v in stats.items() if k != "samples"},
+        )
+        print(stats)
+        return 0
+
+    if args.command == "set-telegram":
+        result = set_telegram_handle(
+            con,
+            handle=args.handle,
+            person_id=args.id,
+            email=args.email,
+            linkedin_url=args.linkedin_url,
+            full_name=args.name,
+        )
+        if not result["matched"]:
+            print(f"set-telegram: {result.get('reason', 'no match')}", file=sys.stderr)
+            return 1
+        print(f"set telegram_handle for {result['full_name']} → @{result['handle']}")
+        return 0
+
+    if args.command == "import-telegram":
+        stats = import_telegram_csv(con, args.file, lookup=args.lookup)
+        record_source_run(
+            con, source="telegram_csv_import", source_ref=args.file, status="ok",
+            stats={"matched": stats["matched"], "unmatched": stats["unmatched"]},
+        )
+        print(stats)
+        return 0
+
+    if args.command == "prepare-telegram-keepalive":
+        for draft_id in prepare_telegram_keepalive(con, limit=args.limit):
+            print(draft_id)
+        return 0
+
+    if args.command == "telegram-links":
+        markdown = render_telegram_links(con, status=args.status, limit=args.limit)
+        _write_or_print(markdown, args.out)
+        return 0
+
+    if args.command == "push-drafts":
+        try:
+            stats = push_drafts_to_gmail(con, status=args.status, limit=args.limit)
+        except AuthRequired as exc:
+            print(f"push-drafts: {exc}", file=sys.stderr)
+            return 2
+        record_source_run(con, source="gmail_drafts_push", source_ref=None, status="ok", stats={
+            "pushed": stats["pushed"], "skipped": stats["skipped"], "errors": len(stats["errors"]),
+        })
+        for item in stats["items"]:
+            print(f"  pushed: {item['name']} <{item['to']}> → gmail_draft={item['gmail_draft_id']}")
+        for err in stats["errors"]:
+            print(f"  skipped: {err}", file=sys.stderr)
+        print(f"\n{stats['pushed']} drafts pushed to Gmail; {stats['skipped']} skipped.")
+        return 0
+
+    if args.command == "cleanup-people":
+        candidates = find_misclassified(con)
+        if args.limit:
+            candidates = candidates[: args.limit]
+        if not candidates:
+            print("No misclassified person rows found.")
+            return 0
+        for cand in candidates:
+            print(
+                f"  {cand['id'][:8]}  reason={cand['reason']:22s}  full_name={cand['full_name']!r}"
+            )
+        print(f"\n{len(candidates)} candidates", "(dry-run)" if not args.delete else "(deleting)")
+        if args.delete:
+            removed = delete_people(con, [c["id"] for c in candidates])
+            print(f"Deleted {removed} people (cascade cleaned roles/interactions/values).")
+        return 0
+
+    if args.command == "merge-people":
+        dupes = [d.strip() for d in args.from_ids.split(",") if d.strip()]
+        result = merge_people(con, primary_id=args.into, duplicate_ids=dupes)
+        print(result)
+        return 0
+
+    if args.command == "set-consent":
+        result = set_consent_status(
+            con,
+            status=args.status,
+            person_id=args.id,
+            email=args.email,
+            linkedin_url=args.linkedin_url,
+            full_name=args.name,
+        )
+        if not result["matched"]:
+            print(f"set-consent: {result.get('reason', 'no match')}", file=sys.stderr)
+            return 1
+        print(f"set consent for {result['full_name']} → {result['status']}")
+        return 0
+
+    if args.command == "import-drive":
+        try:
+            meta = download_drive_file(con, file_id=args.file_id, dest=args.out)
+        except (AuthRequired, OAuthError) as exc:
+            print(f"import-drive: {exc}", file=sys.stderr)
+            return 2
+        print(f"downloaded: {meta['name']} → {meta['path']} ({meta['size_bytes']} bytes, {meta['mime_type']})")
+
+        treat = args.treat_as
+        path = meta["path"]
+        if treat == "linkedin":
+            stats = import_connections(con, path)
+            record_source_run(con, source="linkedin_connections", source_ref=path, status="ok", stats=stats)
+        elif treat == "linkedin-interactions":
+            stats = import_linkedin_interactions(con, path, owner_name=args.owner, limit=args.limit)
+            record_source_run(con, source="linkedin_interactions", source_ref=path, status="ok", stats=stats)
+        elif treat == "gmail-json":
+            stats = import_gmail_json(con, path, mailbox_owner=args.owner, limit=args.limit)
+            record_source_run(con, source="gmail_json", source_ref=path, status="ok", stats=stats)
+        elif treat == "x":
+            stats = import_x_export(con, path, owner_handle=args.owner, limit=args.limit)
+            record_source_run(con, source="x_export", source_ref=path, status="ok", stats=stats)
+        else:
+            stats = {"status": "downloaded_only"}
+        print(stats)
+        return 0
+
+    if args.command == "sync-linkedin":
+        try:
+            if not TokenStore(con).get("linkedin"):
+                auth_linkedin_owner(con, open_browser=not args.no_browser)
+            if args.guided_export:
+                stats = guided_linkedin_export(
+                    con,
+                    watch_dir=args.watch_dir,
+                    timeout_s=args.timeout,
+                    open_browser=not args.no_browser,
+                )
+                print(f"linkedin guided export: {stats}")
+            else:
+                try:
+                    stats = sync_linkedin_dma(con)
+                    print(f"linkedin dma: {stats}")
+                except LinkedInDMARequired as exc:
+                    print(str(exc))
+                    print("Hint: pass --guided-export to walk through a CSV download instead.")
+        except (AuthRequired, OAuthError) as exc:
+            print(f"sync-linkedin: {exc}", file=sys.stderr)
+            return 2
         return 0
 
     raise AssertionError(f"Unhandled command: {args.command}")

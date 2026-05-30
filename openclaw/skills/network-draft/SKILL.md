@@ -28,11 +28,28 @@ Approve:
 network-chief approve-draft --id <draft-id>
 ```
 
-Reject:
+Reject — always pass a reason so the feedback loop can learn:
 
 ```bash
-network-chief reject-draft --id <draft-id>
+network-chief reject-draft --id <draft-id> --reason wrong_timing
 ```
+
+Reason codes (free text allowed): `wrong_timing | weak_context | wrong_channel | too_transactional | duplicate | not_relevant`. When one reason exceeds 30% of rejections in a window, `network-chief agent-review` raises a 🟧 finding so templates can be tuned.
+
+Outcome tracking (closed loop):
+
+- `network-chief push-drafts` records the Gmail thread on each pushed draft.
+- The next `network-chief sync-google` detects replies on those threads and flips the draft's `outcome` to `responded` (tagging the incoming interaction `sentiment=reply`).
+- People who reply get a ranking bonus (they surface higher in the next `brief`).
+- For drafts you sent manually (no stored thread), `network-chief sync-google --heuristic` infers a reply when the recipient emails back after the draft was sent.
+
+Do-not-contact:
+
+```bash
+network-chief set-consent --email someone@example.com --status opted_out   # or: paused | active
+```
+
+Contacts with consent_status other than `active` are excluded from ranking, brief, keepalive, Gmail push, and Telegram links. Use this before any bulk outreach to honour opt-outs.
 
 Outbound rule:
 

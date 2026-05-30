@@ -31,3 +31,9 @@ Rules:
 - Prefer official exports and APIs over scraping.
 - Every recommendation should explain the goal, rationale, suggested channel, and risk.
 - Draft first, ask for approval, then use the appropriate channel only after approval.
+
+## Autonomous operation
+
+`network-chief autopilot --once` runs the full SENSE → THINK → ACT → REPORT loop unattended (see the `network-autopilot` skill). It self-directs from `agent-review` findings, preparing outreach across all channels and staging it into Gmail Drafts.
+
+Outbound sending is governed by the autonomy policy (`network-chief policy`). The default is **level 0 (prepare-only) + dry-run** — consistent with "draft first, ask for approval." Higher levels (bounded / full auto-send on Gmail) send only after the operator explicitly arms them with `policy set`, and even then every send is bounded by consent, verified-address, daily-cap, quiet-hours, and min-days-between-touches guardrails. The approval gate is the default, not the only mode.

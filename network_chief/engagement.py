@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from typing import Any
+from urllib.parse import quote
 
 from .db import rows_to_dicts
 from .drafts import create_custom_draft, create_draft
@@ -31,6 +32,59 @@ def prepare_gmail_keepalive(con: sqlite3.Connection, *, limit: int = 10) -> list
         if len(draft_ids) >= limit:
             break
     return draft_ids
+
+
+def prepare_telegram_keepalive(con: sqlite3.Connection, *, limit: int = 10) -> list[str]:
+    """Telegram analog of prepare_gmail_keepalive — top stale-high-value contacts who have a telegram_handle."""
+    draft_ids: list[str] = []
+    for person in rank_people(con, limit=limit * 5):
+        if not (person.get("telegram_handle") or "").strip():
+            continue
+        draft_ids.append(create_draft(con, person=person, goal=person.get("goal"), channel="telegram"))
+        if len(draft_ids) >= limit:
+            break
+    return draft_ids
+
+
+def render_telegram_links(con: sqlite3.Connection, *, status: str = "draft", limit: int | None = None) -> str:
+    """Render pending Telegram drafts as clickable t.me deep-links (no Bot API needed)."""
+    sql = """
+        SELECT d.id, p.full_name, p.telegram_handle, d.subject, d.body, d.rationale, d.created_at
+          FROM drafts d JOIN people p ON p.id = d.person_id
+         WHERE d.channel = 'telegram'
+           AND d.status = ?
+           AND p.telegram_handle IS NOT NULL AND p.telegram_handle != ''
+           AND COALESCE(p.consent_status, 'active') = 'active'
+         ORDER BY d.created_at DESC
+    """
+    params: list[Any] = [status]
+    if limit:
+        sql += " LIMIT ?"
+        params.append(limit)
+    rows = con.execute(sql, tuple(params)).fetchall()
+    lines = [
+        f"# Telegram drafts ({len(rows)})",
+        "",
+        "Each link opens Telegram (web or app) with the recipient pre-selected and the message pre-typed. "
+        "Review and click **Send** in Telegram. Then mark the local draft with "
+        "`network-chief approve-draft --id <uuid>` to feed the approval-rate KPI.",
+        "",
+    ]
+    for row in rows:
+        handle = (row["telegram_handle"] or "").lstrip("@")
+        body = row["body"] or ""
+        url = f"https://t.me/{handle}?text={quote(body)}"
+        lines.append(f"## {row['full_name']} — @{handle}")
+        lines.append(f"_draft id: `{row['id']}`_")
+        lines.append("")
+        lines.append(f"> {body.replace(chr(10), chr(10) + '> ')}")
+        lines.append("")
+        lines.append(f"[Open in Telegram →]({url})")
+        lines.append("")
+    if not rows:
+        lines.append("_No pending Telegram drafts. Run `network-chief discover-telegram` then "
+                     "`network-chief prepare-telegram-keepalive`._")
+    return "\n".join(lines)
 
 
 def prepare_linkedin_posts(con: sqlite3.Connection, *, topic: str | None = None, count: int = 3) -> list[str]:
@@ -169,3 +223,89 @@ def prepare_x_comments(con: sqlite3.Connection, *, topic: str | None = None, cou
             )
         )
     return draft_ids
+
+
+def publish_linkedin_assist(
+    con: sqlite3.Connection,
+    *,
+    draft_id: str | None = None,
+    open_browser: bool = True,
+    out_file: str | None = None,
+) -> dict[str, Any]:
+    """One-tap LinkedIn publishing helper.
+
+    LinkedIn has no public Posts API for personal apps, so the closest
+    real automation is: pick the next approved ``linkedin_post`` draft,
+    copy its body to the system clipboard, open LinkedIn's share dialog
+    in the browser, and (on success) mark the draft ``status='sent'`` so
+    the loop knows it's published.
+
+    Tries ``pbcopy`` (macOS), ``xclip``/``wl-copy`` (Linux), then falls
+    back to writing the body to ``out_file`` so the user can copy it
+    manually.
+    """
+    import shutil
+    import subprocess
+    import webbrowser
+
+    if draft_id:
+        row = con.execute(
+            "SELECT id, body, status FROM drafts WHERE id = ? AND channel = 'linkedin_post'",
+            (draft_id,),
+        ).fetchone()
+    else:
+        row = con.execute(
+            "SELECT id, body, status FROM drafts WHERE channel='linkedin_post' AND status='approved' "
+            "ORDER BY created_at LIMIT 1"
+        ).fetchone()
+        if row is None:
+            row = con.execute(
+                "SELECT id, body, status FROM drafts WHERE channel='linkedin_post' AND status='draft' "
+                "ORDER BY created_at LIMIT 1"
+            ).fetchone()
+    if row is None:
+        return {"ok": False, "reason": "no linkedin_post draft found"}
+
+    body = row["body"] or ""
+    copied_via = None
+    for tool, cmd in (("pbcopy", ["pbcopy"]), ("xclip", ["xclip", "-selection", "clipboard"]),
+                      ("wl-copy", ["wl-copy"])):
+        if shutil.which(tool):
+            try:
+                subprocess.run(cmd, input=body.encode("utf-8"), check=True)
+                copied_via = tool
+                break
+            except Exception:
+                continue
+
+    if out_file:
+        from pathlib import Path
+        p = Path(out_file)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body, encoding="utf-8")
+
+    share_url = "https://www.linkedin.com/feed/?shareActive=true"
+    if open_browser:
+        try:
+            webbrowser.open(share_url, new=1, autoraise=True)
+        except Exception:
+            pass
+
+    # Mark as sent in the local pipeline (user is about to paste+post).
+    from .db import now_iso
+    ts = now_iso()
+    con.execute(
+        "UPDATE drafts SET status='sent', sent_at=?, updated_at=? WHERE id=?",
+        (ts, ts, row["id"]),
+    )
+    con.commit()
+
+    return {
+        "ok": True,
+        "draft_id": row["id"],
+        "previous_status": row["status"],
+        "clipboard": copied_via,
+        "out_file": out_file,
+        "share_url": share_url,
+        "body_preview": body[:120],
+    }

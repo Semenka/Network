@@ -7,10 +7,10 @@ from .db import new_id, now_iso, rows_to_dicts
 
 
 def choose_channel(person: dict[str, Any]) -> str:
-    if person.get("primary_email"):
-        return "gmail"
     if person.get("telegram_handle"):
         return "telegram"
+    if person.get("primary_email"):
+        return "gmail"
     if person.get("whatsapp_phone") or person.get("phone"):
         return "whatsapp"
     if person.get("linkedin_url"):
@@ -18,19 +18,64 @@ def choose_channel(person: dict[str, Any]) -> str:
     return "note"
 
 
-def compose_draft(person: dict[str, Any], goal: dict[str, Any] | None = None) -> dict[str, str]:
+def compose_draft(
+    person: dict[str, Any],
+    goal: dict[str, Any] | None = None,
+    *,
+    channel: str | None = None,
+) -> dict[str, str]:
     name = str(person.get("full_name") or "there").split()[0]
     orgs = person.get("organizations") or "your current work"
     titles = person.get("titles") or ""
+    primary_title = titles.split(",")[0].strip() if titles else ""
+    last_subject = (person.get("last_interaction_subject") or "").strip()
+    staleness = int(person.get("staleness_days") or 0)
     goal_title = goal.get("title") if goal else None
     success_metric = goal.get("success_metric") if goal else None
+    is_telegram = (channel or "").lower() == "telegram"
 
-    if goal_title:
+    # Merge-field context clause shared by the generic branches.
+    snippet = last_subject[:60]
+    if last_subject:
+        context = 'Last time we connected it was around "' + snippet + '". '
+        goal_last_clause = 'Last time it was around "' + snippet + '". '
+    elif primary_title:
+        context = f"I have you as {primary_title} at {orgs}. "
+        goal_last_clause = ""
+    else:
+        context = f"I have {orgs} associated with your current work in my notes. "
+        goal_last_clause = ""
+
+    # Staleness-aware subject so drafts aren't all identical.
+    if staleness >= 180:
+        stale_subject = "Long overdue catch-up"
+    elif staleness >= 90:
+        stale_subject = "Reconnecting"
+    else:
+        stale_subject = "Quick catch-up"
+
+    if goal_title and is_telegram:
+        subject = f"Catch-up — {goal_title}"
+        body = (
+            f"Hey {name} — quick one. I'm focused on {goal_title}"
+            f"{f' ({success_metric})' if success_metric else ''} this week and was thinking about your "
+            f"{orgs} work. Up for a 15-min call?"
+        )
+        rationale = f"Goal-linked Telegram outreach: {goal_title}"
+    elif is_telegram:
+        subject = stale_subject
+        lead = f"Hey {name} — " + (
+            f"it's been a while. {context}" if staleness >= 90 else f"wanted to reconnect. {context}"
+        )
+        body = (lead + "Free for a quick 15-min call sometime soon?").strip()
+        rationale = "Relationship maintenance — Telegram"
+    elif goal_title:
         subject = f"Quick catch-up around {goal_title}"
         body = (
             f"Hi {name},\n\n"
             f"I was thinking about your work around {orgs}"
-            f"{f' ({titles})' if titles else ''} and wanted to reconnect.\n\n"
+            f"{f' ({primary_title})' if primary_title else ''} and wanted to reconnect. "
+            f"{goal_last_clause}\n\n"
             f"I am currently focused on: {goal_title}."
             f"{f' The concrete outcome I am aiming for is {success_metric}.' if success_metric else ''}\n\n"
             "Would you be open to a short catch-up next week? I would be glad to hear what you are working on "
@@ -40,11 +85,11 @@ def compose_draft(person: dict[str, Any], goal: dict[str, Any] | None = None) ->
         )
         rationale = f"Goal-linked outreach: {goal_title}"
     else:
-        subject = "Quick catch-up"
+        subject = stale_subject
+        opener = "It has been a while and I wanted to reconnect." if staleness >= 90 else "I wanted to reconnect and hear what you are focused on these days."
         body = (
             f"Hi {name},\n\n"
-            "I wanted to reconnect and hear what you are focused on these days. "
-            f"I have {orgs} associated with your current work in my notes.\n\n"
+            f"{opener} {context}\n\n"
             "Would you be open to a short catch-up sometime soon?\n\n"
             "Best,\n"
             "Andrey"
@@ -62,9 +107,9 @@ def create_draft(
     channel: str | None = None,
     status: str = "draft",
 ) -> str:
-    draft = compose_draft(person, goal)
-    ts = now_iso()
     channel = channel or choose_channel(person)
+    draft = compose_draft(person, goal, channel=channel)
+    ts = now_iso()
     existing = con.execute(
         """
         SELECT id FROM drafts
@@ -172,10 +217,22 @@ def list_drafts(con: sqlite3.Connection, status: str | None = "draft") -> list[d
     return rows_to_dicts(rows)
 
 
-def set_draft_status(con: sqlite3.Connection, draft_id: str, status: str) -> bool:
+def set_draft_status(
+    con: sqlite3.Connection,
+    draft_id: str,
+    status: str,
+    *,
+    reason: str | None = None,
+) -> bool:
     cur = con.execute(
-        "UPDATE drafts SET status = ?, updated_at = ? WHERE id = ?",
-        (status, now_iso(), draft_id),
+        """
+        UPDATE drafts
+           SET status = ?,
+               rejection_reason = CASE WHEN ? = 'rejected' THEN ? ELSE rejection_reason END,
+               updated_at = ?
+         WHERE id = ?
+        """,
+        (status, status, reason, now_iso(), draft_id),
     )
     con.commit()
     return cur.rowcount > 0

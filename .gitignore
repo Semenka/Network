@@ -16,5 +16,15 @@ exports/
 *.sqlite3
 .env
 
+# Live dashboards / retrospectives contain aggregate counts about the
+# real network — keep only dashboards/example.md (built from public
+# smoke data) in the repo.
+dashboards/dashboard-*.md
+dashboards/dashboard-*.json
+dashboards/agent-review-*.md
+dashboards/agent-review-*.json
+dashboards/autopilot-digest.md
+dashboards/autopilot-*.json
+
 # OpenClaw local runtime state.
 .openclaw/
